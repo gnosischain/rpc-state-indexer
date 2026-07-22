@@ -49,6 +49,9 @@ class RuntimeSettings(BaseSettings):
     )
     metrics_port: int = Field(default=9090, alias="METRICS_PORT", ge=1, le=65535)
     daemon_poll_seconds: int = Field(default=300, alias="DAEMON_POLL_SECONDS", ge=10)
+    # Comma-separated job names the daemon runs each cycle; empty = every daily job. Use this to
+    # scope a single daemon away from the full multi-thousand-target catalog.
+    daemon_jobs: str = Field(default="", alias="DAEMON_JOBS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @field_validator("clickhouse_database")
@@ -57,6 +60,11 @@ class RuntimeSettings(BaseSettings):
         if not value.replace("_", "a").isalnum() or value[0].isdigit():
             raise ValueError("invalid ClickHouse database name")
         return value
+
+    def daemon_job_names(self) -> frozenset[str] | None:
+        """The job names the daemon should run, or None to run every daily job."""
+        names = frozenset(item.strip() for item in self.daemon_jobs.split(",") if item.strip())
+        return names or None
 
     def endpoints(self, *, required: bool = True) -> tuple[EndpointSetting, ...]:
         urls = [item.strip() for item in self.rpc_urls.split(",") if item.strip()]

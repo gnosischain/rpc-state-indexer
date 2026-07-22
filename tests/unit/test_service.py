@@ -206,3 +206,70 @@ async def test_daemon_closes_health_listener_when_service_startup_fails(
         await run_daemon(settings=RuntimeSettings())
 
     assert health.closed is True
+
+
+class _StopLoop(Exception):
+    """Sentinel to break the daemon's infinite loop after exactly one cycle."""
+
+
+class _FakeGuard:
+    healthy = True
+
+    def ensure_healthy(self) -> None:
+        return None
+
+
+class _FakeDaemonJob:
+    def __init__(self, name: str, cadence: str) -> None:
+        self.name = name
+        self.cadence = cadence
+
+
+class _FakeDaemonService:
+    def __init__(self, jobs: list[_FakeDaemonJob]) -> None:
+        self.guard = _FakeGuard()
+        self._job_list = jobs
+        self.censused: list[str] = []
+
+    def _jobs(self, _name: str | None) -> list[_FakeDaemonJob]:
+        return self._job_list
+
+    async def census(self, _snapshot_date: date, *, job_name: str) -> None:
+        self.censused.append(job_name)
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_daemon_counts_cycles_and_honours_job_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from prometheus_client import REGISTRY
+
+    jobs = [
+        _FakeDaemonJob("daily_a", "daily"),
+        _FakeDaemonJob("daily_b", "daily"),
+        _FakeDaemonJob("manual_c", "manual"),
+    ]
+    fake = _FakeDaemonService(jobs)
+
+    async def open_fake(_settings: RuntimeSettings, _operation: str) -> Any:
+        return fake
+
+    async def stop_sleep(_seconds: float) -> None:
+        raise _StopLoop
+
+    monkeypatch.setattr(service_module, "start_health_server", lambda *a, **k: FakeHealth())
+    monkeypatch.setattr(service_module, "_with_service", open_fake)
+    monkeypatch.setattr("rpc_state_indexer.service.asyncio.sleep", stop_sleep)
+
+    metric = "rpc_indexer_daemon_cycles_total"
+    before = REGISTRY.get_sample_value(metric) or 0.0
+    # DAEMON_JOBS scopes the daemon to one job; the manual job is skipped by cadence.
+    with pytest.raises(_StopLoop):
+        await run_daemon(settings=RuntimeSettings(DAEMON_JOBS="daily_a"))
+
+    after = REGISTRY.get_sample_value(metric) or 0.0
+    assert after == before + 1.0
+    assert fake.censused == ["daily_a"]

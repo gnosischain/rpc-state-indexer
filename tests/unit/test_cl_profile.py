@@ -6,7 +6,7 @@ the same two-position shape as the live pools: lower(+net) / upper(-net) boundar
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date
 from typing import Any
 from uuid import uuid4
@@ -25,31 +25,40 @@ DIGEST = "d" * 64
 class FakeStore:
     database = "test"
 
-    def __init__(self, states, ticks) -> None:
+    def __init__(
+        self, states: list[dict[str, Any]], ticks: list[dict[str, Any]]
+    ) -> None:
         self._states = states
         self._ticks = ticks
         self.written: list[dict[str, Any]] = []
         self.dedup_tokens: list[str | None] = []
 
-    def query_rows(self, sql: str, parameters: Mapping[str, Any] | None = None):
+    def query_rows(
+        self, sql: str, parameters: Mapping[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         if "v_pool_cl_state_published" in sql:
             return list(self._states)
         # tick query is filtered by pool + attempt in the real store; the fake serves all
         return list(self._ticks)
 
-    def insert_rows(self, table, rows, *, deduplication_token=None) -> int:
+    def insert_rows(
+        self,
+        table: str,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        deduplication_token: str | None = None,
+    ) -> int:
         materialized = [dict(r) for r in rows]
         self.written.extend(materialized)
         self.dedup_tokens.append(deduplication_token)
         return len(materialized)
 
 
-def _state():
+def _state() -> dict[str, Any]:
     return {"pool_address": POOL, "attempt_id": ATTEMPT, "result_digest": DIGEST}
 
 
-def _ticks(pairs):
-    # pairs: list of (tick, liquidity_net)
+def _ticks(pairs: list[tuple[int, int]]) -> list[dict[str, Any]]:
     return [{"tick": t, "liquidity_net": n} for t, n in pairs]
 
 

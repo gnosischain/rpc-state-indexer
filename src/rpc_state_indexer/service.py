@@ -49,6 +49,13 @@ from rpc_state_indexer.execution.base import (
     VerifiedBatchResult,
 )
 from rpc_state_indexer.observability.health import HealthServer, start_health_server
+from rpc_state_indexer.observability.metrics import (
+    CENSUS_PUBLICATIONS,
+    COMPUTE_ROWS,
+    DAEMON_CYCLES,
+    DAEMON_JOB_FAILURES,
+    ENDPOINT_HEALTHY,
+)
 from rpc_state_indexer.rpc.capabilities import probe_endpoint_capabilities
 from rpc_state_indexer.runtime import (
     RpcRuntime,
@@ -359,6 +366,9 @@ class IndexerService:
             except Exception as exc:
                 endpoint.healthy = False
                 endpoint.cooldown_until = float("inf")
+                ENDPOINT_HEALTHY.labels(
+                    endpoint.provider_group, endpoint.fingerprint[:12]
+                ).set(0)
                 _emit(
                     "endpoint_probe",
                     provider_group=endpoint.provider_group,
@@ -368,6 +378,9 @@ class IndexerService:
                 )
                 continue
             successful.append(endpoint)
+            ENDPOINT_HEALTHY.labels(
+                endpoint.provider_group, endpoint.fingerprint[:12]
+            ).set(1)
             _emit(
                 "endpoint_probe",
                 provider_group=endpoint.provider_group,
@@ -551,6 +564,7 @@ class IndexerService:
                         target_address=token.address,
                         snapshot_date=snapshot_date,
                     ):
+                        CENSUS_PUBLICATIONS.labels(job.name, "token", "skipped").inc()
                         _emit(
                             "census_skipped_published",
                             job=job.name,
@@ -563,11 +577,13 @@ class IndexerService:
                             job, token, snapshot_date, anchor
                         )
                     except Exception as exc:
+                        CENSUS_PUBLICATIONS.labels(job.name, "token", "failed").inc()
                         failures.append(
                             f"{job.name}/{token.symbol}: {type(exc).__name__}"
                         )
                         continue
                     attempts.append(attempt)
+                    CENSUS_PUBLICATIONS.labels(job.name, "token", "published").inc()
                     _emit(
                         "census_published",
                         job=job.name,
@@ -586,17 +602,20 @@ class IndexerService:
                         target_address=pool.address,
                         snapshot_date=snapshot_date,
                     ):
+                        CENSUS_PUBLICATIONS.labels(job.name, "pool", "skipped").inc()
                         continue
                     try:
                         attempt = await runner.run_pool(
                             job, pool, snapshot_date, anchor
                         )
                     except Exception as exc:
+                        CENSUS_PUBLICATIONS.labels(job.name, "pool", "failed").inc()
                         failures.append(
                             f"{job.name}/{pool.name}: {type(exc).__name__}"
                         )
                         continue
                     attempts.append(attempt)
+                    CENSUS_PUBLICATIONS.labels(job.name, "pool", "published").inc()
                     _emit(
                         "census_published",
                         job=job.name,
@@ -778,6 +797,7 @@ def run_compute(
                 chain_id=catalog.chain.chain_id,
                 snapshot_date=snapshot_date,
             )
+            COMPUTE_ROWS.labels(compute_module.name).inc(count)
             _emit(
                 "compute_complete",
                 module=compute_module.name,
@@ -810,6 +830,7 @@ async def run_daemon(*, settings: RuntimeSettings) -> None:
     except Exception as exc:
         _emit("health_server_start_failed", error=type(exc).__name__)
         health = None
+    allowed_jobs = settings.daemon_job_names()
     try:
         service = await _with_service(settings, "daemon")
         ready = True
@@ -817,18 +838,23 @@ async def run_daemon(*, settings: RuntimeSettings) -> None:
             if service.guard is None:
                 raise ServiceError("daemon writer guard is unavailable")
             service.guard.ensure_healthy()
+            DAEMON_CYCLES.inc()
             target = _yesterday()
             for job in service._jobs(None):
-                if job.cadence == "daily":
-                    try:
-                        await service.census(target, job_name=job.name)
-                    except JobRunError as exc:
-                        _emit(
-                            "daemon_job_failed",
-                            job=job.name,
-                            failure_count=len(exc.failures),
-                        )
-                    service.guard.ensure_healthy()
+                if job.cadence != "daily":
+                    continue
+                if allowed_jobs is not None and job.name not in allowed_jobs:
+                    continue
+                try:
+                    await service.census(target, job_name=job.name)
+                except JobRunError as exc:
+                    DAEMON_JOB_FAILURES.labels(job.name).inc()
+                    _emit(
+                        "daemon_job_failed",
+                        job=job.name,
+                        failure_count=len(exc.failures),
+                    )
+                service.guard.ensure_healthy()
             await asyncio.sleep(settings.daemon_poll_seconds)
     finally:
         ready = False

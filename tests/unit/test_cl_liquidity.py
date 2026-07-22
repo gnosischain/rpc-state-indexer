@@ -207,7 +207,9 @@ async def test_active_liquidity_mismatch_blocks_publication() -> None:
 
 @pytest.mark.asyncio
 async def test_reverted_tick_becomes_error_not_zero() -> None:
-    responses = {**uni_state(), **UNI_POSITION, "tk/4096": (3, "execution reverted")}
+    responses: dict[str, bytes | tuple[int, str]] = {
+        **uni_state(), **UNI_POSITION, "tk/4096": (3, "execution reverted")
+    }
     exe = FakeExecutor(responses)
     result = await ClLiquidityCollector(exe).collect(pool=uni_pool(), anchor=ANCHOR)
 
@@ -233,7 +235,9 @@ async def test_bitmap_flag_without_initialized_struct_is_error() -> None:
 
 @pytest.mark.asyncio
 async def test_reverted_state_read_raises() -> None:
-    responses = {**uni_state(), **UNI_POSITION, "slot0": (3, "execution reverted")}
+    responses: dict[str, bytes | tuple[int, str]] = {
+        **uni_state(), **UNI_POSITION, "slot0": (3, "execution reverted")
+    }
     exe = FakeExecutor(responses)
     with pytest.raises(ValueError, match="CL state read"):
         await ClLiquidityCollector(exe).collect(pool=uni_pool(), anchor=ANCHOR)

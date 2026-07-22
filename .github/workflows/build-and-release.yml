@@ -1,0 +1,69 @@
+name: Build & Release rpc-state-indexer
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: rpc-state-indexer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: make install-dev
+
+      - name: Lint, type-check, and test
+        run: make check          # ruff + no-zero-default + no-silent-rpc + pytest + mypy(src,tests)
+
+      - name: Validate the catalog offline
+        run: make validate-config
+
+  build:
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get organization name
+        id: org_name
+        run: echo "org_name=${{ github.repository_owner }}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract commit hash
+        id: commit
+        uses: prompt/actions-commit-hash@v3
+
+      - name: Set up QEMU        # emulation for the non-native (arm64) build leg
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --tag ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-rpc-state-indexer:latest \
+            --tag ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-rpc-state-indexer:${{ steps.commit.outputs.short }} \
+            --push .

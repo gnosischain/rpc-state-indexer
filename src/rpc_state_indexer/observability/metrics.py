@@ -32,23 +32,46 @@ PUBLISH_LAG_DAYS = Gauge(
     "Days from UTC snapshot date to successful publication.",
     ("job", "token"),
 )
-COVERAGE_GAP_DAYS = Gauge(
-    "rpc_indexer_coverage_gap_days",
-    "Current known publication coverage gap in days.",
-    ("job", "token"),
-)
 RPC_BATCH_SECONDS = Histogram(
     "rpc_indexer_rpc_batch_seconds",
     "Verified historical batch latency.",
     ("executor",),
     buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60),
 )
+CENSUS_PUBLICATIONS = Counter(
+    "rpc_indexer_census_publications_total",
+    "Census target outcomes per job (published, failed, or skipped-already-published).",
+    ("job", "target_kind", "outcome"),
+)
+DAEMON_CYCLES = Counter(
+    "rpc_indexer_daemon_cycles_total",
+    "Daemon scheduler cycles started.",
+)
+DAEMON_JOB_FAILURES = Counter(
+    "rpc_indexer_daemon_job_failures_total",
+    "Daemon job runs that ended with at least one target failure.",
+    ("job",),
+)
+ENDPOINT_HEALTHY = Gauge(
+    "rpc_indexer_endpoint_healthy",
+    "1 if the endpoint passed its last capability probe, else 0.",
+    ("provider_group", "endpoint"),
+)
+COMPUTE_ROWS = Counter(
+    "rpc_indexer_compute_rows_written_total",
+    "Derived rows written by a compute module.",
+    ("module",),
+)
 
 __all__ = [
     "BATCH_SENTINEL_FAILURES",
-    "CENSUS_CALL_FAILURES",
     "CENSUS_CALLS",
-    "COVERAGE_GAP_DAYS",
+    "CENSUS_CALL_FAILURES",
+    "CENSUS_PUBLICATIONS",
+    "COMPUTE_ROWS",
+    "DAEMON_CYCLES",
+    "DAEMON_JOB_FAILURES",
+    "ENDPOINT_HEALTHY",
     "PUBLISH_LAG_DAYS",
     "RPC_BATCH_SECONDS",
     "SUPPLY_RESIDUAL_PPM",

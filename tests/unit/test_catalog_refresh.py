@@ -10,13 +10,14 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import ModuleType
 
 import yaml
 
 ROOT = Path(__file__).parents[2]
 
 
-def _load(module_name: str, path: Path):
+def _load(module_name: str, path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
