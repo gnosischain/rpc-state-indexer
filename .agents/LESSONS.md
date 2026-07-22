@@ -18,3 +18,4 @@ line here when you record a lesson. Convention: [`README.md`](README.md).
 - [Gnosis public archive can't eth_call at pre-EIP-2930 blocks](lessons/gnosis-public-archive-eip2930.md) — use a real archive node for deep history.
 - [DEX pool reserves publish as ~0](lessons/balanceof-pool-zero-for-vault-dexes.md) — Vault-custody DEXs (Balancer) need a Vault collector, not balanceOf(pool).
 - [Algebra/Swapr V3 tick discovery finds no ticks](lessons/cl-bitmap-convention-differs.md) — Uniswap tickBitmap keys on compressed tick, Algebra tickTable on raw tick.
+- [backfill aborts at early dates: "TOK: ValueError" per token](lessons/backfill-aborts-on-not-deployed-targets.md) — `_active` must skip targets whose deployment_block > anchor; enumerated targets have no date_start.

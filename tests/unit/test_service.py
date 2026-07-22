@@ -9,6 +9,7 @@ import pytest
 
 from rpc_state_indexer import service as service_module
 from rpc_state_indexer.config.loader import load_catalog
+from rpc_state_indexer.config.models import PoolAssetConfig, PoolConfig
 from rpc_state_indexer.domain import BlockRef, ExecutorKind
 from rpc_state_indexer.execution.base import (
     ContractCall,
@@ -29,6 +30,18 @@ from rpc_state_indexer.settings import RuntimeSettings
 
 ANCHOR = BlockRef(100, "0x" + "11" * 32, "0x" + "22" * 32, 1234)
 ROOT = Path(__file__).parents[2]
+
+
+def test_active_skips_target_not_deployed_at_anchor() -> None:
+    pool = PoolConfig(
+        address="0x" + "ab" * 20, name="p", pool_class="uniswap_v3", deployment_block=1000,
+        assets=[PoolAssetConfig(token="0x" + "cd" * 20)],
+    )
+    day = date(2024, 1, 1)
+    assert IndexerService._active(pool, day, anchor_block=999) is False   # not deployed yet
+    assert IndexerService._active(pool, day, anchor_block=1000) is True   # deployed at anchor
+    assert IndexerService._active(pool, day, anchor_block=5000) is True
+    assert IndexerService._active(pool, day) is True  # no anchor -> block check skipped
 
 
 def test_month_end_backfill_includes_partial_last_month_anchor() -> None:

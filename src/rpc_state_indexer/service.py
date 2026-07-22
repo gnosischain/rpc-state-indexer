@@ -447,10 +447,20 @@ class IndexerService:
         return visit(universe_name, set())
 
     @staticmethod
-    def _active(target: TokenConfig | PoolConfig, snapshot_date: date) -> bool:
+    def _active(
+        target: TokenConfig | PoolConfig,
+        snapshot_date: date,
+        anchor_block: int | None = None,
+    ) -> bool:
         if target.date_start is not None and snapshot_date < target.date_start:
             return False
-        return target.date_end is None or snapshot_date < target.date_end
+        if target.date_end is not None and snapshot_date >= target.date_end:
+            return False
+        # A target that is not yet deployed at the anchor is skipped, not attempted: reading its
+        # state before it has code is a hard failure, which would otherwise abort the whole date.
+        if anchor_block is not None and anchor_block < target.deployment_block:
+            return False
+        return True
 
     def _discovery_service(self) -> DiscoveryService:
         catalog, repository, runtime = self._required()
@@ -480,7 +490,7 @@ class IndexerService:
             if job.universe is None or not self._uses_full_holders(job.universe):
                 continue
             for token in catalog.token_targets(job):
-                if self._active(token, snapshot_date):
+                if self._active(token, snapshot_date, anchor.number):
                     selected[token.address] = token
         discovery = self._discovery_service()
         failures: list[str] = []
@@ -555,7 +565,7 @@ class IndexerService:
         for job in self._jobs(job_name):
             if job.target_kind == "tokens":
                 for token in catalog.token_targets(job):
-                    if not self._active(token, snapshot_date):
+                    if not self._active(token, snapshot_date, anchor.number):
                         continue
                     if repository.publication_exists(
                         chain_id=catalog.chain.chain_id,
@@ -593,7 +603,7 @@ class IndexerService:
                     )
             else:
                 for pool in catalog.pool_targets(job):
-                    if not self._active(pool, snapshot_date):
+                    if not self._active(pool, snapshot_date, anchor.number):
                         continue
                     if repository.publication_exists(
                         chain_id=catalog.chain.chain_id,
@@ -633,7 +643,7 @@ class IndexerService:
         tokens = [
             token
             for token in catalog.tokens.values()
-            if token.enabled and self._active(token, snapshot_date)
+            if token.enabled and self._active(token, snapshot_date, anchor.number)
         ]
         if not tokens:
             raise ServiceError("no enabled token is active on the benchmark date")
@@ -740,8 +750,25 @@ async def run_backfill(
         dates = tuple(_date_range(from_date, to_date)) if daily else _month_end_dates(
             from_date, to_date
         )
+        # Process every date; a failure on one date must not abort the whole range (a long
+        # backfill will hit transient errors). Collect failed dates and surface them at the end.
+        failed: list[str] = []
         for snapshot_date in dates:
-            await service.census(snapshot_date, job_name=job)
+            try:
+                await service.census(snapshot_date, job_name=job)
+            except JobRunError as exc:
+                failed.append(f"{snapshot_date}({len(exc.failures)})")
+                _emit(
+                    "backfill_date_failed",
+                    snapshot_date=snapshot_date,
+                    failure_count=len(exc.failures),
+                )
+        if failed:
+            raise ServiceError(
+                f"backfill finished with {len(failed)}/{len(dates)} dates having target "
+                f"failures: {', '.join(failed[:30])}"
+                + (" ..." if len(failed) > 30 else "")
+            )
     finally:
         await service.close()
 

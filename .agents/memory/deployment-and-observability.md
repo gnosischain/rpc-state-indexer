@@ -29,8 +29,21 @@ PodMonitor. Secrets via ESO from SSM ParameterStore: `analytics-preview-rpc-stat
   `RPC_URLS` + `RPC_PROVIDER_GROUPS` (cow uses per-chain). The ESO secret_key_ref maps accordingly.
 - The **daemon runs every `cadence: daily` job each cycle** — the full catalog is thousands of
   targets (incl. CL tick sweeps). Scope with the `DAEMON_JOBS` setting (comma-separated job names;
-  empty = all) and bound CL with `CL_MIN_ACTIVE_LIQUIDITY`. tfvars defaults to
-  `daily_pool_reserves,daily_cl_liquidity` + `poll 3600s`.
+  empty = all) and bound CL with `CL_MIN_ACTIVE_LIQUIDITY`.
+
+**Deployment modularity (the two layers map differently):** Layer-1 ingestion "cases" are catalog
+jobs; because of the **single-writer-per-chain** heartbeat they all run inside the ONE `daemon`
+Deployment (5_continuous.tf) — they can't be separate concurrent pods. Per-deployment selection is
+the `ingestion_jobs` list var → `DAEMON_JOBS`. Layer-2 compute is RPC-free + no writer guard, so it's
+a **separate CronJob** (6_compute.tf, `enable_compute`) that shells `date -u -d yesterday` → `compute
+--date` (no image change) and needs only the ClickHouse secret, not the RPC secret. Adding an
+ingestion case = new collector+job in the app + append to `ingestion_jobs`; adding a compute module =
+app REGISTRY only (the CronJob runs all). The README has the full step-by-step SSM/ESO secret setup.
+
+**Backfill:** the daemon is **forward-only (yesterday each cycle)** — it never fills history or missed
+days. `7_backfill.tf` is a one-shot `backfill --from --to [--daily|--month-end] [--job]` Job (gated
+`run_backfill`) for history/gaps. It's a per-chain writer → **mutually exclusive with the daemon**
+(pause `enable_continuous` first). Re-runs are safe (publication gate skips done target/date pairs).
 
 **Metrics (this repo, `observability/metrics.py`):** added `census_publications_total{job,
 target_kind,outcome}`, `daemon_cycles_total`, `daemon_job_failures_total{job}`,
