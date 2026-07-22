@@ -1,0 +1,35 @@
+services:
+  daemon:
+    build:
+      context: .
+    image: rpc-state-indexer:local
+    env_file: ${ENV_FILE:-.env}
+    command: ["daemon"]
+    ports:
+      - "${METRICS_PORT:-9090}:${METRICS_PORT:-9090}"
+    restart: unless-stopped
+    profiles: ["daemon"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; from urllib.request import urlopen; urlopen('http://127.0.0.1:' + os.environ.get('METRICS_PORT', '9090') + '/live', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  migrations:
+    build:
+      context: .
+    image: rpc-state-indexer:local
+    env_file: ${ENV_FILE:-.env}
+    command: ["migrate"]
+    restart: "no"
+    profiles: ["migrations"]
+
+  jobs:
+    build:
+      context: .
+    image: rpc-state-indexer:local
+    env_file: ${ENV_FILE:-.env}
+    command: ["status"]
+    restart: "no"
+    profiles: ["jobs"]

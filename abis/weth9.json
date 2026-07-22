@@ -1,0 +1,5 @@
+[
+  {"type":"event","name":"Deposit","anonymous":false,"inputs":[{"name":"dst","type":"address","indexed":true},{"name":"wad","type":"uint256","indexed":false}]},
+  {"type":"event","name":"Withdrawal","anonymous":false,"inputs":[{"name":"src","type":"address","indexed":true},{"name":"wad","type":"uint256","indexed":false}]}
+]
+

@@ -1,0 +1,542 @@
+"""Typed table boundary for ClickHouse persistence.
+
+The repository intentionally exposes append/insert operations.  Repairs create new
+attempts; there are no UPDATE, DELETE, mutation, or partition-replacement helpers here.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import date
+from typing import Any
+from uuid import UUID
+
+from .digests import (
+    BalanceDigestRow,
+    PoolBalanceDigestRow,
+    PoolClStateDigestRow,
+    PoolTickDigestRow,
+    ScalarDigestRow,
+    digest_cl_observations,
+    digest_pool_observations,
+    digest_token_observations,
+    digest_universe,
+)
+from .migrations import validate_database_name
+
+_TABLE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "config_registry": (
+        "chain_id", "job_name", "target_kind", "target_address", "cadence",
+        "integrity_mode", "coverage_start", "coverage_end", "config_hash",
+        "canonical_config_json", "enabled", "registered_at",
+    ),
+    "day_anchors": (
+        "chain_id", "snapshot_date", "resolution_id", "block_number", "block_hash",
+        "parent_hash", "block_timestamp", "next_block_number", "next_block_hash",
+        "next_block_timestamp", "finalized_at_resolution", "resolution_source",
+        "endpoint_fingerprint", "resolved_at",
+    ),
+    "discovery_ranges": (
+        "chain_id", "token_address", "topic0", "range_start_block",
+        "range_end_block_exclusive", "scan_id", "status", "anchor_block", "anchor_hash",
+        "log_count", "holder_count", "attempt_count", "endpoint_fingerprint",
+        "error_class", "error_message", "started_at", "heartbeat_at", "finished_at",
+    ),
+    "holder_universe": (
+        "chain_id", "token_address", "holder_address", "source", "source_detail",
+        "first_seen_block", "last_seen_block", "observations",
+    ),
+    "census_attempts": (
+        "chain_id", "job_name", "target_kind", "target_address", "snapshot_date",
+        "attempt_id", "status", "integrity_mode", "config_hash", "anchor_block",
+        "anchor_hash", "executor_kind", "block_reference_kind", "universe_hash",
+        "universe_size", "batches_total", "batches_verified", "observations_ok",
+        "observations_failed", "result_digest", "batches_json", "error_class",
+        "error_message", "started_at", "heartbeat_at", "finished_at",
+    ),
+    "census_universe_members": (
+        "chain_id", "job_name", "target_kind", "target_address", "snapshot_date",
+        "attempt_id", "holder_address", "member_sources", "member_ordinal", "inserted_at",
+    ),
+    "census_errors": (
+        "chain_id", "job_name", "target_kind", "target_address", "snapshot_date",
+        "attempt_id", "subject_address", "call_kind", "batch_sequence", "error_class",
+        "rpc_code", "return_data", "error_message", "terminal_at",
+    ),
+    "token_balances": (
+        "chain_id", "job_name", "token_address", "snapshot_date", "attempt_id",
+        "holder_address", "balance_raw", "scaled_balance_raw", "value_kind",
+        "probe_source", "batch_sequence", "observed_at",
+    ),
+    "token_scalars": (
+        "chain_id", "job_name", "token_address", "snapshot_date", "attempt_id",
+        "scalar_name", "scalar_raw", "probe_source", "batch_sequence", "observed_at",
+    ),
+    "pool_token_balances": (
+        "chain_id", "job_name", "pool_address", "token_address", "snapshot_date",
+        "attempt_id", "balance_raw", "probe_source", "batch_sequence", "observed_at",
+    ),
+    "pool_cl_state": (
+        "chain_id", "job_name", "pool_address", "snapshot_date", "attempt_id",
+        "pool_class", "sqrt_price_x96", "current_tick", "liquidity",
+        "fee_growth_global_0_x128", "fee_growth_global_1_x128", "tick_spacing", "fee",
+        "tick_count", "probe_source", "batch_sequence", "observed_at",
+    ),
+    "pool_tick_liquidity": (
+        "chain_id", "job_name", "pool_address", "snapshot_date", "attempt_id",
+        "tick", "liquidity_gross", "liquidity_net", "fee_growth_outside_0_x128",
+        "fee_growth_outside_1_x128", "probe_source", "batch_sequence", "observed_at",
+    ),
+    "pool_liquidity_profile": (
+        "chain_id", "pool_address", "snapshot_date", "tick_lower", "tick_upper",
+        "active_liquidity", "source_attempt_id", "source_result_digest", "computed_at",
+    ),
+    "census_publications": (
+        "chain_id", "job_name", "target_kind", "target_address", "snapshot_date",
+        "publication_id", "attempt_id", "executor_kind", "block_reference_kind",
+        "integrity_mode", "config_hash", "anchor_block", "anchor_hash", "universe_hash",
+        "universe_size", "result_digest", "observed_sum_raw", "reference_supply_raw",
+        "batches_total", "observations_total", "provider_groups", "checks_passed",
+        "published_at",
+    ),
+    "writer_heartbeats": (
+        "chain_id", "process_id", "operation", "hostname", "details_json", "started_at",
+        "heartbeat_at",
+    ),
+}
+
+
+class ClickHouseRepository:
+    def __init__(self, client: Any, database: str) -> None:
+        self.client = client
+        self.database = validate_database_name(database)
+
+    def ping(self) -> bool:
+        self.client.command("SELECT 1")
+        return True
+
+    def insert_rows(
+        self,
+        table: str,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        deduplication_token: str | None = None,
+    ) -> int:
+        """Insert mappings with a deterministic, schema-defined column order."""
+
+        if not _TABLE_RE.fullmatch(table) or table not in TABLE_COLUMNS:
+            raise ValueError(f"unsupported persistence table: {table!r}")
+        materialized = list(rows)
+        if not materialized:
+            return 0
+
+        supplied = set(materialized[0])
+        allowed = set(TABLE_COLUMNS[table])
+        unknown = supplied - allowed
+        if unknown:
+            raise ValueError(f"unknown columns for {table}: {sorted(unknown)}")
+        if "insert_version" in supplied:
+            raise ValueError("insert_version is materialized and must not be supplied")
+
+        for index, row in enumerate(materialized[1:], start=1):
+            if set(row) != supplied:
+                raise ValueError(
+                    f"row {index} for {table} has different columns from the first row"
+                )
+
+        columns = [column for column in TABLE_COLUMNS[table] if column in supplied]
+        data = [[row[column] for column in columns] for row in materialized]
+        settings: dict[str, Any] = {"async_insert": 0}
+        if deduplication_token is not None:
+            if not deduplication_token:
+                raise ValueError("deduplication token cannot be empty")
+            settings["insert_deduplication_token"] = deduplication_token
+
+        self.client.insert(
+            f"{self.database}.{table}",
+            data,
+            column_names=columns,
+            settings=settings,
+        )
+        return len(materialized)
+
+    def register_configs(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        return self.insert_rows("config_registry", rows)
+
+    def insert_anchor(self, row: Mapping[str, Any]) -> int:
+        return self.insert_rows("day_anchors", [row])
+
+    def insert_discovery_ranges(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        return self.insert_rows("discovery_ranges", rows)
+
+    def insert_holder_observations(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        return self.insert_rows("holder_universe", rows)
+
+    def completed_discovery_ranges(
+        self,
+        chain_id: int,
+        token_address: str,
+        topic0: str,
+    ) -> list[tuple[int, int]]:
+        rows = self.query_rows(
+            f"""
+            SELECT range_start_block, range_end_block_exclusive
+            FROM {self.database}.discovery_ranges FINAL
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND token_address = {{token_address:String}}
+              AND topic0 = {{topic0:String}}
+              AND status = 'completed'
+            ORDER BY range_start_block, range_end_block_exclusive
+            """,
+            {
+                "chain_id": chain_id,
+                "token_address": token_address,
+                "topic0": topic0,
+            },
+        )
+        return [
+            (int(row["range_start_block"]), int(row["range_end_block_exclusive"]))
+            for row in rows
+        ]
+
+    def holder_addresses(self, chain_id: int, token_address: str) -> tuple[str, ...]:
+        rows = self.query_rows(
+            f"""
+            SELECT holder_address
+            FROM {self.database}.holder_universe
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND token_address = {{token_address:String}}
+            GROUP BY holder_address
+            HAVING sum(observations) > 0
+            ORDER BY holder_address
+            """,
+            {"chain_id": chain_id, "token_address": token_address},
+        )
+        return tuple(str(row["holder_address"]) for row in rows)
+
+    def insert_attempt_state(self, row: Mapping[str, Any]) -> int:
+        return self.insert_rows("census_attempts", [row])
+
+    def insert_universe_members(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        attempt_id: UUID,
+    ) -> int:
+        return self.insert_rows(
+            "census_universe_members",
+            rows,
+            deduplication_token=f"universe:{attempt_id}",
+        )
+
+    def insert_token_balances(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        attempt_id: UUID,
+        batch_sequence: int,
+    ) -> int:
+        return self.insert_rows(
+            "token_balances",
+            rows,
+            deduplication_token=f"{attempt_id}:balances:{batch_sequence}",
+        )
+
+    def insert_token_scalars(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        attempt_id: UUID,
+        batch_sequence: int,
+    ) -> int:
+        return self.insert_rows(
+            "token_scalars",
+            rows,
+            deduplication_token=f"{attempt_id}:scalars:{batch_sequence}",
+        )
+
+    def insert_pool_balances(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        attempt_id: UUID,
+        batch_sequence: int,
+    ) -> int:
+        return self.insert_rows(
+            "pool_token_balances",
+            rows,
+            deduplication_token=f"{attempt_id}:pools:{batch_sequence}",
+        )
+
+    def insert_pool_cl_state(
+        self, rows: Iterable[Mapping[str, Any]], *, attempt_id: UUID
+    ) -> int:
+        return self.insert_rows(
+            "pool_cl_state",
+            rows,
+            deduplication_token=f"{attempt_id}:cl_state",
+        )
+
+    def insert_pool_ticks(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        attempt_id: UUID,
+        batch_sequence: int,
+    ) -> int:
+        return self.insert_rows(
+            "pool_tick_liquidity",
+            rows,
+            deduplication_token=f"{attempt_id}:cl_ticks:{batch_sequence}",
+        )
+
+    def insert_terminal_errors(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        return self.insert_rows("census_errors", rows)
+
+    def append_publication(self, row: Mapping[str, Any]) -> int:
+        return self.insert_rows("census_publications", [row])
+
+    def publication_exists(
+        self,
+        *,
+        chain_id: int,
+        job_name: str,
+        target_kind: str,
+        target_address: str,
+        snapshot_date: date,
+    ) -> bool:
+        rows = self.query_rows(
+            f"""
+            SELECT count() AS publications
+            FROM {self.database}.v_publications_current
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND job_name = {{job_name:String}}
+              AND target_kind = {{target_kind:String}}
+              AND target_address = {{target_address:String}}
+              AND snapshot_date = {{snapshot_date:Date}}
+            """,
+            {
+                "chain_id": chain_id,
+                "job_name": job_name,
+                "target_kind": target_kind,
+                "target_address": target_address,
+                "snapshot_date": snapshot_date,
+            },
+        )
+        return bool(rows and int(rows[0]["publications"]) > 0)
+
+    def heartbeat(self, row: Mapping[str, Any]) -> int:
+        return self.insert_rows("writer_heartbeats", [row])
+
+    def fresh_writer_processes(
+        self, chain_id: int, stale_seconds: int
+    ) -> tuple[str, ...]:
+        rows = self.query_rows(
+            f"""
+            SELECT toString(process_id) AS process_id
+            FROM {self.database}.writer_heartbeats FINAL
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND heartbeat_at >= now64(9)
+                  - toIntervalSecond({{stale_seconds:UInt64}})
+            ORDER BY process_id
+            """,
+            {"chain_id": chain_id, "stale_seconds": stale_seconds},
+        )
+        return tuple(str(row["process_id"]) for row in rows)
+
+    def query_rows(
+        self,
+        sql: str,
+        parameters: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        result = self.client.query(sql, parameters=dict(parameters or {}))
+        if hasattr(result, "named_results"):
+            return list(result.named_results())
+        column_names: Sequence[str] = getattr(result, "column_names", ())
+        return [
+            dict(zip(column_names, values, strict=True))
+            for values in getattr(result, "result_rows", ())
+        ]
+
+    def canonical_anchor(self, chain_id: int, snapshot_date: date) -> dict[str, Any] | None:
+        rows = self.query_rows(
+            f"""
+            SELECT *
+            FROM {self.database}.v_day_anchors_canonical
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND snapshot_date = {{snapshot_date:Date}}
+            LIMIT 1
+            """,
+            {"chain_id": chain_id, "snapshot_date": snapshot_date},
+        )
+        return rows[0] if rows else None
+
+    def active_config_hash(
+        self,
+        chain_id: int,
+        job_name: str,
+        target_kind: str,
+        target_address: str,
+    ) -> str | None:
+        rows = self.query_rows(
+            f"""
+            SELECT config_hash
+            FROM {self.database}.v_config_registry_current
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND job_name = {{job_name:String}}
+              AND target_kind = {{target_kind:String}}
+              AND target_address = {{target_address:String}}
+            LIMIT 1
+            """,
+            {
+                "chain_id": chain_id,
+                "job_name": job_name,
+                "target_kind": target_kind,
+                "target_address": target_address,
+            },
+        )
+        if not rows:
+            return None
+        value = rows[0]["config_hash"]
+        return value.decode("ascii") if isinstance(value, bytes) else str(value)
+
+    def terminal_error_count(self, attempt_id: UUID) -> int:
+        result = self.client.query(
+            f"""
+            SELECT count()
+            FROM {self.database}.census_errors FINAL
+            WHERE attempt_id = {{attempt_id:UUID}}
+            """,
+            parameters={"attempt_id": attempt_id},
+        )
+        return int(result.result_rows[0][0])
+
+    def readback_universe_digest(self, attempt_id: UUID) -> str:
+        rows = self.query_rows(
+            f"""
+            SELECT holder_address, member_sources
+            FROM {self.database}.census_universe_members FINAL
+            WHERE attempt_id = {{attempt_id:UUID}}
+            ORDER BY holder_address
+            """,
+            {"attempt_id": attempt_id},
+        )
+        return digest_universe(
+            (row["holder_address"], row["member_sources"]) for row in rows
+        )
+
+    def readback_token_digest(self, attempt_id: UUID) -> str:
+        balances = self.query_rows(
+            f"""
+            SELECT holder_address, balance_raw, scaled_balance_raw, value_kind
+            FROM {self.database}.token_balances FINAL
+            WHERE attempt_id = {{attempt_id:UUID}}
+            ORDER BY holder_address
+            """,
+            {"attempt_id": attempt_id},
+        )
+        scalars = self.query_rows(
+            f"""
+            SELECT scalar_name, scalar_raw
+            FROM {self.database}.token_scalars FINAL
+            WHERE attempt_id = {{attempt_id:UUID}}
+            ORDER BY scalar_name
+            """,
+            {"attempt_id": attempt_id},
+        )
+        return digest_token_observations(
+            (
+                BalanceDigestRow(
+                    holder_address=str(row["holder_address"]),
+                    balance_raw=int(row["balance_raw"]),
+                    scaled_balance_raw=(
+                        None
+                        if row["scaled_balance_raw"] is None
+                        else int(row["scaled_balance_raw"])
+                    ),
+                    value_kind=str(row["value_kind"]),
+                )
+                for row in balances
+            ),
+            (
+                ScalarDigestRow(
+                    scalar_name=str(row["scalar_name"]),
+                    scalar_raw=int(row["scalar_raw"]),
+                )
+                for row in scalars
+            ),
+        )
+
+    def readback_pool_digest(self, attempt_id: UUID) -> str:
+        rows = self.query_rows(
+            f"""
+            SELECT pool_address, token_address, balance_raw
+            FROM {self.database}.pool_token_balances FINAL
+            WHERE attempt_id = {{attempt_id:UUID}}
+            ORDER BY pool_address, token_address
+            """,
+            {"attempt_id": attempt_id},
+        )
+        return digest_pool_observations(
+            PoolBalanceDigestRow(
+                pool_address=str(row["pool_address"]),
+                token_address=str(row["token_address"]),
+                balance_raw=int(row["balance_raw"]),
+            )
+            for row in rows
+        )
+
+    def readback_cl_digest(self, attempt_id: UUID) -> str:
+        state_rows = self.query_rows(
+            f"""
+            SELECT pool_address, sqrt_price_x96, current_tick, liquidity,
+                   fee_growth_global_0_x128, fee_growth_global_1_x128,
+                   tick_spacing, fee, tick_count
+            FROM {self.database}.pool_cl_state FINAL
+            WHERE attempt_id = {{attempt_id:UUID}}
+            LIMIT 1
+            """,
+            {"attempt_id": attempt_id},
+        )
+        if not state_rows:
+            raise ValueError(f"no persisted CL state for attempt {attempt_id}")
+        row = state_rows[0]
+        state = PoolClStateDigestRow(
+            pool_address=str(row["pool_address"]),
+            sqrt_price_x96=int(row["sqrt_price_x96"]),
+            current_tick=int(row["current_tick"]),
+            liquidity=int(row["liquidity"]),
+            fee_growth_global_0_x128=int(row["fee_growth_global_0_x128"]),
+            fee_growth_global_1_x128=int(row["fee_growth_global_1_x128"]),
+            tick_spacing=int(row["tick_spacing"]),
+            fee=int(row["fee"]),
+            tick_count=int(row["tick_count"]),
+        )
+        tick_rows = self.query_rows(
+            f"""
+            SELECT pool_address, tick, liquidity_gross, liquidity_net,
+                   fee_growth_outside_0_x128, fee_growth_outside_1_x128
+            FROM {self.database}.pool_tick_liquidity FINAL
+            WHERE attempt_id = {{attempt_id:UUID}}
+            ORDER BY tick
+            """,
+            {"attempt_id": attempt_id},
+        )
+        return digest_cl_observations(
+            state,
+            (
+                PoolTickDigestRow(
+                    pool_address=str(tick["pool_address"]),
+                    tick=int(tick["tick"]),
+                    liquidity_gross=int(tick["liquidity_gross"]),
+                    liquidity_net=int(tick["liquidity_net"]),
+                    fee_growth_outside_0_x128=int(tick["fee_growth_outside_0_x128"]),
+                    fee_growth_outside_1_x128=int(tick["fee_growth_outside_1_x128"]),
+                )
+                for tick in tick_rows
+            ),
+        )

@@ -1,0 +1,16 @@
+universes:
+  full_holders:
+    kind: full_holders
+  treasury:
+    kind: explicit_list
+    source: vendored/treasury_addresses.csv
+    address_column: address
+  full_plus_treasury:
+    kind: union
+    of:
+    - full_holders
+    - treasury
+  supply_probe:
+    kind: explicit_list
+    source: vendored/supply_probe.csv
+    address_column: address

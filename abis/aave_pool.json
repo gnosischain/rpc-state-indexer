@@ -1,0 +1,4 @@
+[
+  {"type":"function","name":"getReserveNormalizedIncome","stateMutability":"view","inputs":[{"name":"asset","type":"address"}],"outputs":[{"name":"","type":"uint256"}]}
+]
+

@@ -1,0 +1,5 @@
+[
+  {"type":"function","name":"scaledBalanceOf","stateMutability":"view","inputs":[{"name":"user","type":"address"}],"outputs":[{"name":"","type":"uint256"}]},
+  {"type":"function","name":"scaledTotalSupply","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"uint256"}]}
+]
+

@@ -1,0 +1,17 @@
+services:
+  daemon:
+    volumes:
+      - ./config:/app/config:ro
+      - ./abis:/app/abis:ro
+    environment:
+      LOG_LEVEL: DEBUG
+
+  migrations:
+    volumes:
+      - ./migrations:/app/migrations:ro
+
+  jobs:
+    volumes:
+      - ./config:/app/config:ro
+      - ./abis:/app/abis:ro
+      - ./migrations:/app/migrations:ro
