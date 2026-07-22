@@ -26,6 +26,7 @@ from rpc_state_indexer.domain import (
 )
 from rpc_state_indexer.errors import PublicationBlocked
 from rpc_state_indexer.execution.base import VerificationEvidence
+from rpc_state_indexer.observability.metrics import SUPPLY_RESIDUAL_PPM
 from rpc_state_indexer.storage.digests import (
     BalanceDigestRow,
     ScalarDigestRow,
@@ -171,9 +172,13 @@ class FakeCollector:
         )
 
 
-def runner(store: FakeStore, collector: FakeCollector) -> tuple[CensusRunner, Any, Any]:
+def runner(
+    store: FakeStore,
+    collector: FakeCollector,
+    job_name: str = "daily_treasury",
+) -> tuple[CensusRunner, Any, Any]:
     catalog = load_catalog(ROOT / "config", "gnosis")
-    job = catalog.jobs["daily_treasury"]
+    job = catalog.jobs[job_name]
     token = catalog.tokens["0xe91d153e0b41518a2ce8dd3d7944fa863463a97d"]
     subject = CensusRunner(
         catalog=catalog,
@@ -202,6 +207,51 @@ async def test_dense_observed_zero_can_be_published() -> None:
     folded = json.loads(verified["batches_json"])
     assert isinstance(folded, list) and len(folded) == verified["batches_total"]
     assert all("verified" in batch for batch in folded)
+
+
+def _residual_ppm_for(symbol: str) -> float | None:
+    """Current value of the supply-residual gauge for a token symbol, or None if unset."""
+    for metric in SUPPLY_RESIDUAL_PPM.collect():
+        for sample in metric.samples:
+            if sample.labels.get("token") == symbol:
+                return sample.value
+    return None
+
+
+def _clear_residual(symbol: str) -> None:
+    try:
+        SUPPLY_RESIDUAL_PPM.remove(symbol)
+    except KeyError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_supply_residual_gauge_skips_scoped_jobs() -> None:
+    # daily_treasury is a `scoped` job: it reads totalSupply but only sums a subset of holders,
+    # so its holder-sum-vs-supply residual is meaningless (a spurious ~100%). It must NOT touch
+    # the token-labelled gauge, or it would overwrite the real full_supply reading for that token.
+    store = FakeStore()
+    subject, job, token = runner(store, FakeCollector())  # daily_treasury -> scoped
+    _clear_residual(token.symbol)
+
+    await subject.run_token(job, token, date(2026, 7, 18), ANCHOR)
+
+    assert len(store.publications) == 1
+    assert _residual_ppm_for(token.symbol) is None
+
+
+@pytest.mark.asyncio
+async def test_supply_residual_gauge_set_for_full_supply_jobs() -> None:
+    # daily_curated_balances is a `full_supply` job: observed_sum is the full holder sweep, so the
+    # residual vs totalSupply IS the reconciliation and must be published to the gauge.
+    store = FakeStore()
+    subject, job, token = runner(store, FakeCollector(), job_name="daily_curated_balances")
+    _clear_residual(token.symbol)
+
+    await subject.run_token(job, token, date(2026, 7, 18), ANCHOR)
+
+    assert len(store.publications) == 1
+    assert _residual_ppm_for(token.symbol) == 0.0
 
 
 @pytest.mark.asyncio

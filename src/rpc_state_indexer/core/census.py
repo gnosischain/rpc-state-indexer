@@ -838,7 +838,16 @@ class CensusRunner:
                 "published_at": finished,
             }
         )
-        if reference_supply is not None:
+        # The holder-sum vs totalSupply reconciliation is only meaningful for jobs that sweep the
+        # FULL holder universe (full_supply / scaled_full_supply). Scoped jobs (treasury, supply
+        # probe) read totalSupply as a scalar but only sum a subset, so their "residual" is a
+        # spurious ~100%. Emitting it here would (a) trip the supply-residual alert falsely and
+        # (b) collide on the token-only gauge label with the real full_supply publication, whose
+        # value would then be overwritten depending on publish order. Gate to the reconciling modes.
+        if reference_supply is not None and job.integrity_mode in (
+            IntegrityMode.FULL_SUPPLY,
+            IntegrityMode.SCALED_FULL_SUPPLY,
+        ):
             denominator = max(1, reference_supply)
             residual_ppm = abs(observed_sum - reference_supply) * 1_000_000 / denominator
             SUPPLY_RESIDUAL_PPM.labels(token=token.symbol).set(residual_ppm)

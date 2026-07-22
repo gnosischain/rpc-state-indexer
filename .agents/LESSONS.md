@@ -19,3 +19,4 @@ line here when you record a lesson. Convention: [`README.md`](README.md).
 - [DEX pool reserves publish as ~0](lessons/balanceof-pool-zero-for-vault-dexes.md) — Vault-custody DEXs (Balancer) need a Vault collector, not balanceOf(pool).
 - [Algebra/Swapr V3 tick discovery finds no ticks](lessons/cl-bitmap-convention-differs.md) — Uniswap tickBitmap keys on compressed tick, Algebra tickTable on raw tick.
 - [backfill aborts at early dates: "TOK: ValueError" per token](lessons/backfill-aborts-on-not-deployed-targets.md) — `_active` must skip targets whose deployment_block > anchor; enumerated targets have no date_start.
+- [supply_residual_ppm reads 100% for a token that reconciles](lessons/supply-residual-metric-scoped-jobs.md) — only emit the residual for full_supply/scaled_full_supply jobs; scoped jobs read totalSupply but don't full-sweep, and the token-only gauge label collides.
