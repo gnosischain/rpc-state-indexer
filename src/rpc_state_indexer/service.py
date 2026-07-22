@@ -746,6 +746,17 @@ async def run_backfill(
     daily: bool,
 ) -> None:
     service = await _with_service(settings, "backfill")
+    # Serve /live, /ready, /metrics for the duration of the backfill so the same census metrics
+    # the daemon exposes (calls, publications, batch latency, sentinel failures) are scrapable
+    # during the long historical run. Readiness tracks the single-writer heartbeat.
+    health: HealthServer | None = None
+    try:
+        health = start_health_server(
+            settings.metrics_port,
+            readiness_probe=lambda: service.guard is not None and service.guard.healthy,
+        )
+    except Exception as exc:
+        _emit("health_server_start_failed", error=type(exc).__name__)
     try:
         dates = tuple(_date_range(from_date, to_date)) if daily else _month_end_dates(
             from_date, to_date
@@ -771,6 +782,8 @@ async def run_backfill(
             )
     finally:
         await service.close()
+        if health is not None:
+            health.close()
 
 
 async def run_densify(
