@@ -24,6 +24,7 @@ from rpc_state_indexer.service import (
     ServiceError,
     _month_end_dates,
     benchmark_single_batch_ceiling,
+    run_backfill,
     run_daemon,
 )
 from rpc_state_indexer.settings import RuntimeSettings
@@ -286,3 +287,55 @@ async def test_daemon_counts_cycles_and_honours_job_filter(
     after = REGISTRY.get_sample_value(metric) or 0.0
     assert after == before + 1.0
     assert fake.censused == ["daily_a"]
+
+
+class _FakeBackfillService:
+    def __init__(self, fail_on: date, exc: Exception) -> None:
+        self.guard = _FakeGuard()
+        self._fail_on = fail_on
+        self._exc = exc
+        self.censused: list[date] = []
+
+    async def census(self, snapshot_date: date, *, job_name: str | None) -> None:
+        self.censused.append(snapshot_date)
+        if snapshot_date == self._fail_on:
+            raise self._exc
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_backfill_survives_transient_error_on_one_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non-JobRunError on a single date (e.g. a ClickHouse connection drop during a Cloud node
+    # restart) must NOT abort the whole range: every date is still attempted, and the run ends
+    # with a summary ServiceError rather than propagating the raw error into the compute loop.
+    boom = date(2021, 3, 5)
+    fake = _FakeBackfillService(boom, RuntimeError("clickhouse connection reset"))
+
+    async def open_fake(_settings: RuntimeSettings, _operation: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(
+        service_module, "start_health_server", lambda *a, **k: FakeHealth()
+    )
+    monkeypatch.setattr(service_module, "_with_service", open_fake)
+
+    with pytest.raises(ServiceError, match="backfill finished with 1/4"):
+        await run_backfill(
+            settings=RuntimeSettings(),
+            from_date=date(2021, 3, 4),
+            to_date=date(2021, 3, 7),
+            job=None,
+            daily=True,
+        )
+
+    # Kept going past the failing date instead of aborting on it.
+    assert fake.censused == [
+        date(2021, 3, 4),
+        date(2021, 3, 5),
+        date(2021, 3, 6),
+        date(2021, 3, 7),
+    ]

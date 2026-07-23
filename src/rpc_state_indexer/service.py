@@ -782,6 +782,18 @@ async def run_backfill(
                     snapshot_date=snapshot_date,
                     failure_count=len(exc.failures),
                 )
+            except Exception as exc:
+                # A non-JobRunError (e.g. a transient ClickHouse connection drop during a Cloud
+                # node restart, or an RPC hiccup outside the per-target guard) must not crash the
+                # whole multi-year ingest and drop into the pointless compute loop. Record the date
+                # and continue; a re-run skips published dates via the gate and re-attempts these.
+                failed.append(f"{snapshot_date}({type(exc).__name__})")
+                _emit(
+                    "backfill_date_failed",
+                    snapshot_date=snapshot_date,
+                    error=type(exc).__name__,
+                    detail=str(exc)[:300],
+                )
         if failed:
             raise ServiceError(
                 f"backfill finished with {len(failed)}/{len(dates)} dates having target "
