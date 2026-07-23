@@ -502,6 +502,14 @@ class IndexerService:
                     anchor_hash=anchor.block_hash,
                 )
             except Exception as exc:
+                # Surface the reason: a failed date otherwise only logs failure_count, forcing a
+                # dig through discovery_ranges to find out what actually broke.
+                _emit(
+                    "discovery_failed",
+                    token=token.symbol,
+                    error=type(exc).__name__,
+                    detail=str(exc)[:500],
+                )
                 failures.append(f"{token.symbol}: {type(exc).__name__}")
                 continue
             _emit(

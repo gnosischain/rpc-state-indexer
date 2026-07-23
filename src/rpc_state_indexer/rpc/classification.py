@@ -45,19 +45,36 @@ _ARCHIVE_MARKERS = (
 )
 _LIMIT_MARKERS = (
     "query returned more than",
+    "exceeds max results",  # Reth/Erigon: "query exceeds max results 20000, retry with the range …"
+    "too many results",
+    "too many logs",
+    "max logs per response",
     "response size exceeded",
     "request entity too large",
     "block range is too wide",
     "block range too wide",
+    "please limit",
     "limit exceeded",
+    "request timed out",
     "out of gas",
     "gas required exceeds",
 )
+# JSON-RPC error codes some providers use for a getLogs range/result cap regardless of the
+# message text. -32602 is deliberately excluded: it is generic "invalid params" and is only a
+# range signal when one of the markers above appears in its message/data.
+_LIMIT_CODES = frozenset({-32005, -32016})
 _REVERT_MARKERS = ("execution reverted", "revert")
 
 
 def _message(exc: BaseException) -> str:
-    return str(exc).casefold()
+    # Some providers keep `message` generic ("invalid params") and put the real reason
+    # (e.g. "query returned more than N results, retry with …") in the JSON-RPC `data`
+    # field. Scan both so a range/result cap is recognised wherever the provider puts it.
+    text = str(exc)
+    data = getattr(exc, "data", None)
+    if data is not None:
+        text = f"{text} {data}"
+    return text.casefold()
 
 
 def classify_rpc_failure(exc: BaseException) -> RpcFailure:
@@ -90,6 +107,8 @@ def classify_rpc_failure(exc: BaseException) -> RpcFailure:
     if any(marker in message for marker in _ARCHIVE_MARKERS):
         return RpcFailure(FailureKind.ARCHIVE_UNAVAILABLE, False, True)
     if any(marker in message for marker in _LIMIT_MARKERS):
+        return RpcFailure(FailureKind.PROVIDER_LIMIT, False, False)
+    if isinstance(exc, RpcResponseError) and exc.code in _LIMIT_CODES:
         return RpcFailure(FailureKind.PROVIDER_LIMIT, False, False)
     if isinstance(exc, RpcResponseError) and any(
         marker in message for marker in _REVERT_MARKERS

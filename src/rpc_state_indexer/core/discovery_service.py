@@ -103,6 +103,14 @@ class DiscoveryService:
             )
         except Exception as exc:
             failed_at = datetime.now(UTC)
+            # Preserve the underlying provider error (the DiscoveryRangeFailed wrapper text is
+            # generic; the real reason — e.g. "query exceeds max results …" — is on __cause__).
+            cause = exc.__cause__
+            detail = (
+                str(exc)
+                if cause is None
+                else f"{exc} | cause: {type(cause).__name__}: {cause}"
+            )
             self.store.insert_discovery_ranges(
                 [
                     {
@@ -120,7 +128,7 @@ class DiscoveryService:
                         "attempt_count": 1,
                         "endpoint_fingerprint": "0" * 64,
                         "error_class": type(exc).__name__,
-                        "error_message": str(exc)[:4096],
+                        "error_message": detail[:4096],
                         "started_at": started_at,
                         "heartbeat_at": failed_at,
                         "finished_at": failed_at,
