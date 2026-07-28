@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 from uuid import UUID
@@ -26,6 +27,43 @@ from .digests import (
 from .migrations import validate_database_name
 
 _TABLE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptScope:
+    """Sort-key prefix identifying one attempt's rows.
+
+    Every attempt/observation table is ordered by
+    ``(chain_id, job_name, <target>_address, snapshot_date, attempt_id, ...)``. A
+    read-back that filters on ``attempt_id`` alone cannot use that prefix, so it
+    degrades into a full scan (with ``FINAL``) that grows without bound as history
+    accumulates. Carrying the prefix keeps every read-back a point lookup.
+    """
+
+    chain_id: int
+    job_name: str
+    target_address: str
+    snapshot_date: date
+    attempt_id: UUID
+
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "chain_id": self.chain_id,
+            "job_name": self.job_name,
+            "target_address": self.target_address,
+            "snapshot_date": self.snapshot_date,
+            "attempt_id": self.attempt_id,
+        }
+
+    @staticmethod
+    def predicate(address_column: str) -> str:
+        return (
+            "chain_id = {chain_id:UInt64}"
+            " AND job_name = {job_name:String}"
+            f" AND {address_column} = {{target_address:String}}"
+            " AND snapshot_date = {snapshot_date:Date}"
+            " AND attempt_id = {attempt_id:UUID}"
+        )
 
 
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -504,49 +542,49 @@ class ClickHouseRepository:
         value = rows[0]["config_hash"]
         return value.decode("ascii") if isinstance(value, bytes) else str(value)
 
-    def terminal_error_count(self, attempt_id: UUID) -> int:
+    def terminal_error_count(self, scope: AttemptScope) -> int:
         result = self.client.query(
             f"""
             SELECT count()
             FROM {self.database}.census_errors FINAL
-            WHERE attempt_id = {{attempt_id:UUID}}
+            WHERE {AttemptScope.predicate("target_address")}
             """,
-            parameters={"attempt_id": attempt_id},
+            parameters=scope.parameters(),
         )
         return int(result.result_rows[0][0])
 
-    def readback_universe_digest(self, attempt_id: UUID) -> str:
+    def readback_universe_digest(self, scope: AttemptScope) -> str:
         rows = self.query_rows(
             f"""
             SELECT holder_address, member_sources
             FROM {self.database}.census_universe_members FINAL
-            WHERE attempt_id = {{attempt_id:UUID}}
+            WHERE {AttemptScope.predicate("target_address")}
             ORDER BY holder_address
             """,
-            {"attempt_id": attempt_id},
+            scope.parameters(),
         )
         return digest_universe(
             (row["holder_address"], row["member_sources"]) for row in rows
         )
 
-    def readback_token_digest(self, attempt_id: UUID) -> str:
+    def readback_token_digest(self, scope: AttemptScope) -> str:
         balances = self.query_rows(
             f"""
             SELECT holder_address, balance_raw, scaled_balance_raw, value_kind
             FROM {self.database}.token_balances FINAL
-            WHERE attempt_id = {{attempt_id:UUID}}
+            WHERE {AttemptScope.predicate("token_address")}
             ORDER BY holder_address
             """,
-            {"attempt_id": attempt_id},
+            scope.parameters(),
         )
         scalars = self.query_rows(
             f"""
             SELECT scalar_name, scalar_raw
             FROM {self.database}.token_scalars FINAL
-            WHERE attempt_id = {{attempt_id:UUID}}
+            WHERE {AttemptScope.predicate("token_address")}
             ORDER BY scalar_name
             """,
-            {"attempt_id": attempt_id},
+            scope.parameters(),
         )
         return digest_token_observations(
             (
@@ -571,15 +609,15 @@ class ClickHouseRepository:
             ),
         )
 
-    def readback_pool_digest(self, attempt_id: UUID) -> str:
+    def readback_pool_digest(self, scope: AttemptScope) -> str:
         rows = self.query_rows(
             f"""
             SELECT pool_address, token_address, balance_raw
             FROM {self.database}.pool_token_balances FINAL
-            WHERE attempt_id = {{attempt_id:UUID}}
+            WHERE {AttemptScope.predicate("pool_address")}
             ORDER BY pool_address, token_address
             """,
-            {"attempt_id": attempt_id},
+            scope.parameters(),
         )
         return digest_pool_observations(
             PoolBalanceDigestRow(
@@ -590,20 +628,20 @@ class ClickHouseRepository:
             for row in rows
         )
 
-    def readback_cl_digest(self, attempt_id: UUID) -> str:
+    def readback_cl_digest(self, scope: AttemptScope) -> str:
         state_rows = self.query_rows(
             f"""
             SELECT pool_address, sqrt_price_x96, current_tick, liquidity,
                    fee_growth_global_0_x128, fee_growth_global_1_x128,
                    tick_spacing, fee, tick_count
             FROM {self.database}.pool_cl_state FINAL
-            WHERE attempt_id = {{attempt_id:UUID}}
+            WHERE {AttemptScope.predicate("pool_address")}
             LIMIT 1
             """,
-            {"attempt_id": attempt_id},
+            scope.parameters(),
         )
         if not state_rows:
-            raise ValueError(f"no persisted CL state for attempt {attempt_id}")
+            raise ValueError(f"no persisted CL state for attempt {scope.attempt_id}")
         row = state_rows[0]
         state = PoolClStateDigestRow(
             pool_address=str(row["pool_address"]),
@@ -621,10 +659,10 @@ class ClickHouseRepository:
             SELECT pool_address, tick, liquidity_gross, liquidity_net,
                    fee_growth_outside_0_x128, fee_growth_outside_1_x128
             FROM {self.database}.pool_tick_liquidity FINAL
-            WHERE attempt_id = {{attempt_id:UUID}}
+            WHERE {AttemptScope.predicate("pool_address")}
             ORDER BY tick
             """,
-            {"attempt_id": attempt_id},
+            scope.parameters(),
         )
         return digest_cl_observations(
             state,

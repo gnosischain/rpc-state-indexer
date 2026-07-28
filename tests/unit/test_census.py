@@ -33,6 +33,7 @@ from rpc_state_indexer.storage.digests import (
     digest_token_observations,
     digest_universe,
 )
+from rpc_state_indexer.storage.repositories import AttemptScope
 
 ROOT = Path(__file__).parents[2]
 HOLDER = "0x" + "11" * 20
@@ -80,20 +81,20 @@ class FakeStore:
         self.publications.append(dict(row))
         return 1
 
-    def terminal_error_count(self, attempt_id: object) -> int:
-        return sum(row["attempt_id"] == attempt_id for row in self.errors)
+    def terminal_error_count(self, scope: AttemptScope) -> int:
+        return sum(row["attempt_id"] == scope.attempt_id for row in self.errors)
 
-    def readback_universe_digest(self, attempt_id: object) -> str:
+    def readback_universe_digest(self, scope: AttemptScope) -> str:
         return digest_universe(
             (
                 str(row["holder_address"]),
                 cast(list[str], row["member_sources"]),
             )
             for row in self.members
-            if row["attempt_id"] == attempt_id
+            if row["attempt_id"] == scope.attempt_id
         )
 
-    def readback_token_digest(self, attempt_id: object) -> str:
+    def readback_token_digest(self, scope: AttemptScope) -> str:
         return digest_token_observations(
             (
                 BalanceDigestRow(
@@ -103,12 +104,12 @@ class FakeStore:
                     str(row["value_kind"]),
                 )
                 for row in self.balances
-                if row["attempt_id"] == attempt_id
+                if row["attempt_id"] == scope.attempt_id
             ),
             (
                 ScalarDigestRow(str(row["scalar_name"]), int(row["scalar_raw"]))
                 for row in self.scalars
-                if row["attempt_id"] == attempt_id
+                if row["attempt_id"] == scope.attempt_id
             ),
         )
 

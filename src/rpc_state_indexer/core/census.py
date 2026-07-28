@@ -43,6 +43,7 @@ from rpc_state_indexer.observability.metrics import (
     SUSPECT_ZEROS,
 )
 from rpc_state_indexer.storage.digests import digest_universe
+from rpc_state_indexer.storage.repositories import AttemptScope
 
 
 class CensusStore(Protocol):
@@ -102,15 +103,15 @@ class CensusStore(Protocol):
 
     def append_publication(self, row: dict[str, Any]) -> int: ...
 
-    def terminal_error_count(self, attempt_id: UUID) -> int: ...
+    def terminal_error_count(self, scope: AttemptScope) -> int: ...
 
-    def readback_universe_digest(self, attempt_id: UUID) -> str: ...
+    def readback_universe_digest(self, scope: AttemptScope) -> str: ...
 
-    def readback_token_digest(self, attempt_id: UUID) -> str: ...
+    def readback_token_digest(self, scope: AttemptScope) -> str: ...
 
-    def readback_pool_digest(self, attempt_id: UUID) -> str: ...
+    def readback_pool_digest(self, scope: AttemptScope) -> str: ...
 
-    def readback_cl_digest(self, attempt_id: UUID) -> str: ...
+    def readback_cl_digest(self, scope: AttemptScope) -> str: ...
 
 
 def executor_kind_for_anchor(catalog: Catalog, anchor: BlockRef) -> ExecutorKind:
@@ -755,16 +756,28 @@ class CensusRunner:
         )
         return "+".join(executor_kinds), "+".join(reference_kinds), providers
 
+    @staticmethod
+    def _scope(base: dict[str, Any]) -> AttemptScope:
+        """Sort-key prefix for this attempt's rows; keeps read-backs point lookups."""
+
+        return AttemptScope(
+            chain_id=base["chain_id"],
+            job_name=base["job_name"],
+            target_address=base["target_address"],
+            snapshot_date=base["snapshot_date"],
+            attempt_id=base["attempt_id"],
+        )
+
     def _publication_checks(
         self,
-        attempt_id: UUID,
+        scope: AttemptScope,
         universe: FrozenUniverse,
         result: TokenCollectionResult | PoolCollectionResult | PoolClCollectionResult,
         readback_digest: str,
     ) -> list[str]:
         failed: list[str] = []
         passed: list[str] = ["historical_code_verified"]
-        if self.store.terminal_error_count(attempt_id) != 0:
+        if self.store.terminal_error_count(scope) != 0:
             failed.append("terminal_errors_present")
         else:
             passed.append("zero_terminal_errors")
@@ -782,7 +795,7 @@ class CensusRunner:
         else:
             passed.append("observation_readback_digest")
         if isinstance(result, TokenCollectionResult):
-            if self.store.readback_universe_digest(attempt_id) != universe.universe_hash:
+            if self.store.readback_universe_digest(scope) != universe.universe_hash:
                 failed.append("universe_readback_digest")
             else:
                 passed.append("universe_readback_digest")
@@ -802,10 +815,9 @@ class CensusRunner:
         universe: FrozenUniverse,
         result: TokenCollectionResult,
     ) -> None:
-        readback = self.store.readback_token_digest(attempt_id)
-        checks = self._publication_checks(
-            attempt_id, universe, result, readback
-        )
+        scope = self._scope(base)
+        readback = self.store.readback_token_digest(scope)
+        checks = self._publication_checks(scope, universe, result, readback)
         executor, reference, providers = self._publication_context(result.batches)
         scalar_values = {row.scalar_name: row.scalar_raw for row in result.scalars}
         if job.integrity_mode is IntegrityMode.SCALED_FULL_SUPPLY:
@@ -895,10 +907,9 @@ class CensusRunner:
         universe: FrozenUniverse,
         result: PoolCollectionResult,
     ) -> None:
-        readback = self.store.readback_pool_digest(attempt_id)
-        checks = self._publication_checks(
-            attempt_id, universe, result, readback
-        )
+        scope = self._scope(base)
+        readback = self.store.readback_pool_digest(scope)
+        checks = self._publication_checks(scope, universe, result, readback)
         executor, reference, providers = self._publication_context(result.batches)
         finished = datetime.now(UTC)
         self.store.insert_attempt_state(
@@ -956,8 +967,9 @@ class CensusRunner:
         universe: FrozenUniverse,
         result: PoolClCollectionResult,
     ) -> None:
-        readback = self.store.readback_cl_digest(attempt_id)
-        checks = self._publication_checks(attempt_id, universe, result, readback)
+        scope = self._scope(base)
+        readback = self.store.readback_cl_digest(scope)
+        checks = self._publication_checks(scope, universe, result, readback)
         executor, reference, providers = self._publication_context(result.batches)
         finished = datetime.now(UTC)
         self.store.insert_attempt_state(
