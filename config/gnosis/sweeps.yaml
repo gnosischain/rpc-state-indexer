@@ -1,0 +1,6 @@
+sweeps:
+  treasury_interactions:
+    universe: treasury
+    topic_positions: [1, 2, 3]
+    # WXDAI deployment (2020-07-27): no treasury-relevant token predates it on Gnosis.
+    start_block: 11173937

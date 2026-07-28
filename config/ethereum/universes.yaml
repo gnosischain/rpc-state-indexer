@@ -1,0 +1,5 @@
+universes:
+  treasury:
+    kind: explicit_list
+    source: vendored/treasury_addresses.csv
+    address_column: address

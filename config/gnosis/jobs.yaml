@@ -95,7 +95,9 @@ jobs:
   daily_treasury:
     target_kind: tokens
     token_selector:
-      all_enabled: true
+      # Runtime-resolved from the wallet-interaction sweep: every ERC20 the treasury
+      # wallets ever received, curated entries enriching where they overlap.
+      discovered: true
     universe: treasury
     cadence: daily
     integrity_mode: scoped

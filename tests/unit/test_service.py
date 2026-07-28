@@ -242,6 +242,7 @@ class _FakeDaemonJob:
 class _FakeDaemonService:
     def __init__(self, jobs: list[_FakeDaemonJob]) -> None:
         self.guard = _FakeGuard()
+        self.catalog = None
         self._job_list = jobs
         self.censused: list[str] = []
 

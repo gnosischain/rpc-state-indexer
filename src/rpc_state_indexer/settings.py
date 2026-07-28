@@ -47,6 +47,11 @@ class RuntimeSettings(BaseSettings):
     cl_min_active_liquidity: int = Field(
         default=0, alias="CL_MIN_ACTIVE_LIQUIDITY", ge=0
     )
+    # A discovered target whose last N census attempts all failed is excluded from new
+    # batches (recorded, never silently zeroed). Curated targets are never quarantined.
+    discovered_quarantine_threshold: int = Field(
+        default=3, alias="DISCOVERED_QUARANTINE_THRESHOLD", ge=1
+    )
     metrics_port: int = Field(default=9090, alias="METRICS_PORT", ge=1, le=65535)
     daemon_poll_seconds: int = Field(default=300, alias="DAEMON_POLL_SECONDS", ge=10)
     # Comma-separated job names the daemon runs each cycle; empty = every daily job. Use this to

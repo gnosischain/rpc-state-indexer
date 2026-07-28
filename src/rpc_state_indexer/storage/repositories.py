@@ -50,6 +50,17 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "chain_id", "token_address", "holder_address", "source", "source_detail",
         "first_seen_block", "last_seen_block", "observations",
     ),
+    "sweep_ranges": (
+        "chain_id", "wallet_address", "topic_position", "range_start_block",
+        "range_end_block_exclusive", "scan_id", "status", "anchor_block", "anchor_hash",
+        "log_count", "attempt_count", "endpoint_fingerprint", "error_class",
+        "error_message", "started_at", "heartbeat_at", "finished_at",
+    ),
+    "wallet_interaction_logs": (
+        "chain_id", "wallet_address", "topic_position", "contract_address", "topic0",
+        "topic_count", "block_number", "block_hash", "transaction_hash", "log_index",
+        "topics", "observed_at",
+    ),
     "census_attempts": (
         "chain_id", "job_name", "target_kind", "target_address", "snapshot_date",
         "attempt_id", "status", "integrity_mode", "config_hash", "anchor_block",
@@ -202,6 +213,95 @@ class ClickHouseRepository:
             (int(row["range_start_block"]), int(row["range_end_block_exclusive"]))
             for row in rows
         ]
+
+    def insert_sweep_ranges(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        return self.insert_rows("sweep_ranges", rows)
+
+    def insert_wallet_interaction_logs(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        return self.insert_rows("wallet_interaction_logs", rows)
+
+    def completed_sweep_ranges(
+        self,
+        chain_id: int,
+        wallet_address: str,
+        topic_position: int,
+    ) -> list[tuple[int, int]]:
+        rows = self.query_rows(
+            f"""
+            SELECT range_start_block, range_end_block_exclusive
+            FROM {self.database}.sweep_ranges FINAL
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND wallet_address = {{wallet_address:String}}
+              AND topic_position = {{topic_position:UInt8}}
+              AND status = 'completed'
+            ORDER BY range_start_block, range_end_block_exclusive
+            """,
+            {
+                "chain_id": chain_id,
+                "wallet_address": wallet_address,
+                "topic_position": topic_position,
+            },
+        )
+        return [
+            (int(row["range_start_block"]), int(row["range_end_block_exclusive"]))
+            for row in rows
+        ]
+
+    def discovered_token_candidates(self, chain_id: int) -> list[tuple[str, int]]:
+        """Sweep-discovered fungible candidates as (address, first_seen_block)."""
+
+        rows = self.query_rows(
+            f"""
+            SELECT
+                contract_address,
+                min(first_seen_block) AS first_seen_block
+            FROM {self.database}.v_sweep_candidate_tokens
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND token_standard IN ('erc20', 'erc20_weth9')
+            GROUP BY contract_address
+            ORDER BY contract_address
+            """,
+            {"chain_id": chain_id},
+        )
+        return [
+            (str(row["contract_address"]), int(row["first_seen_block"])) for row in rows
+        ]
+
+    def quarantined_token_targets(
+        self,
+        chain_id: int,
+        job_name: str,
+        threshold: int,
+    ) -> frozenset[str]:
+        """Targets whose last ``threshold`` census attempts for this job all failed."""
+
+        if threshold < 1:
+            raise ValueError("quarantine threshold must be positive")
+        rows = self.query_rows(
+            f"""
+            SELECT target_address
+            FROM
+            (
+                SELECT
+                    target_address,
+                    status,
+                    row_number() OVER (
+                        PARTITION BY target_address
+                        ORDER BY started_at DESC, attempt_id
+                    ) AS recency
+                FROM {self.database}.census_attempts FINAL
+                WHERE chain_id = {{chain_id:UInt64}}
+                  AND job_name = {{job_name:String}}
+                  AND target_kind = 'token'
+            )
+            WHERE recency <= {{threshold:UInt32}}
+            GROUP BY target_address
+            HAVING count() >= {{threshold:UInt32}}
+               AND countIf(status != 'failed') = 0
+            """,
+            {"chain_id": chain_id, "job_name": job_name, "threshold": threshold},
+        )
+        return frozenset(str(row["target_address"]) for row in rows)
 
     def holder_addresses(self, chain_id: int, token_address: str) -> tuple[str, ...]:
         rows = self.query_rows(

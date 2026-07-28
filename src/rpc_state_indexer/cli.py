@@ -569,6 +569,27 @@ def discover(
 
 
 @app.command()
+def sweep(
+    through: Annotated[
+        str | None,
+        typer.Option("--through", help="Sweep through this UTC snapshot date."),
+    ] = None,
+    sweep: Annotated[
+        str | None,
+        typer.Option("--sweep", help="Limit to one configured sweep."),
+    ] = None,
+) -> None:
+    """Advance wallet-interaction discovery sweeps through a snapshot anchor."""
+
+    _invoke_service(
+        "sweep",
+        _load_settings(),
+        through=_parse_optional_date(through, "--through"),
+        sweep=sweep,
+    )
+
+
+@app.command()
 def census(
     snapshot_date: Annotated[
         str,

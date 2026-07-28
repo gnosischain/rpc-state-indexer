@@ -1,0 +1,12 @@
+# Mainnet runs treasury tracking only: the token set is resolved at runtime from the
+# wallet-interaction sweep (never curated here), scoped to the treasury universe. No
+# full_holders discovery jobs on mainnet.
+jobs:
+  daily_treasury:
+    target_kind: tokens
+    token_selector:
+      discovered: true
+    universe: treasury
+    cadence: daily
+    integrity_mode: scoped
+    coverage_start: null

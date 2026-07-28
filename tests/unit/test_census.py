@@ -125,8 +125,16 @@ class FakeCodeVerifier:
 
 
 class FakeCollector:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        balance: int = 0,
+        holders: tuple[str, ...] = (HOLDER,),
+    ) -> None:
         self.fail = fail
+        self.balance = balance
+        self.holders = holders
 
     async def collect(self, **kwargs: Any) -> TokenCollectionResult:
         token = kwargs["token"]
@@ -149,7 +157,11 @@ class FakeCollector:
                 "failed",
             ),
         ) if self.fail else ()
-        balances = () if self.fail else (BalanceRow(HOLDER, 0),)
+        balances = (
+            ()
+            if self.fail
+            else tuple(BalanceRow(holder, self.balance) for holder in self.holders)
+        )
         scalars = (ScalarRow("totalSupply", 0),)
         return TokenCollectionResult(
             token.address,
@@ -252,6 +264,27 @@ async def test_supply_residual_gauge_set_for_full_supply_jobs() -> None:
 
     assert len(store.publications) == 1
     assert _residual_ppm_for(token.symbol) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_observed_sum_overflowing_uint256_blocks_publication() -> None:
+    # A discovered spam token can mint ~uint256 max to several treasury wallets. Each
+    # balance is a valid uint256 return, but their sum is not — the UInt256 column would
+    # raise an opaque serialization error *after* the attempt was marked verified.
+    store = FakeStore()
+    # Two wallets each holding 2**255 — every read is a valid uint256, the sum is not.
+    subject, job, token = runner(
+        store,
+        FakeCollector(balance=1 << 255, holders=(HOLDER, "0x" + "22" * 20)),
+    )
+
+    with pytest.raises(PublicationBlocked) as excinfo:
+        await subject.run_token(job, token, date(2026, 7, 18), ANCHOR)
+
+    assert "observed_sum_overflow" in str(excinfo.value)
+    assert store.publications == []
+    # Recorded as failed so the discovered-target quarantine can retire it.
+    assert store.attempts[-1]["status"] == "failed"
 
 
 @pytest.mark.asyncio

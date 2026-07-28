@@ -224,17 +224,75 @@ class UniverseConfig(BaseModel):
         return self
 
 
+class SweepConfig(BaseModel):
+    """Wallet-interaction discovery: address-less log scans filtered on indexed topics.
+
+    A sweep finds every event any contract emitted with one of the universe's wallets in
+    an indexed topic position. It discovers *interactions* (candidate assets/protocols);
+    it never measures state. Coverage is tracked per (wallet, topic_position), so adding
+    a wallet later only backfills that wallet.
+    """
+
+    name: str
+    universe: str
+    topic_positions: list[int] = Field(default_factory=lambda: [1, 2, 3])
+    start_block: int = Field(ge=0)
+    enabled: bool = True
+    # A multi-year gap is scanned in windows of this many blocks, each persisted before
+    # the next begins. Bounds memory, makes progress visible, and lets an interrupted
+    # sweep resume from its last committed window instead of restarting.
+    checkpoint_blocks: int = Field(default=100_000, ge=1)
+
+    @model_validator(mode="after")
+    def valid_sweep(self) -> SweepConfig:
+        if not self.topic_positions:
+            raise ValueError("sweep requires at least one topic position")
+        if any(position not in {1, 2, 3} for position in self.topic_positions):
+            raise ValueError("sweep topic positions must be in 1..3")
+        if len(set(self.topic_positions)) != len(self.topic_positions):
+            raise ValueError("sweep topic positions must be unique")
+        return self
+
+
 class TokenSelector(BaseModel):
     addresses: list[Address] = Field(default_factory=list)
     class_in: list[str] = Field(default_factory=list)
     all_enabled: bool = False
+    # Resolve targets at runtime from the wallet-sweep candidates instead of this file.
+    discovered: bool = False
 
     @model_validator(mode="after")
     def exactly_one_selector(self) -> TokenSelector:
-        choices = int(bool(self.addresses)) + int(bool(self.class_in)) + int(self.all_enabled)
+        choices = (
+            int(bool(self.addresses))
+            + int(bool(self.class_in))
+            + int(self.all_enabled)
+            + int(self.discovered)
+        )
         if choices != 1:
             raise ValueError("choose exactly one token selector")
         return self
+
+
+def discovered_token_config(address: str, first_seen_block: int) -> TokenConfig:
+    """Synthesize the runtime target for a sweep-discovered ERC20.
+
+    The symbol is the address (spam tokens carry misleading names) and decimals is a
+    placeholder label — measurement stores raw integers, and observed metadata lives in
+    the admission registry, never here. ``deployment_block = first_seen_block`` makes the
+    existing activity gate start coverage at the wallet's first interaction.
+    """
+
+    return TokenConfig(
+        address=address,
+        symbol=address,
+        decimals=0,
+        token_class="standard_erc20",
+        deployment_block=first_seen_block,
+        discovery_events=[
+            EventConfig(abi="erc20", event="Transfer", holder_topics=[1, 2])
+        ],
+    )
 
 
 class PoolSelector(BaseModel):
@@ -269,6 +327,11 @@ class JobConfig(BaseModel):
                 raise ValueError("token job requires universe")
             if self.integrity_mode is IntegrityMode.POOL_ASSETS:
                 raise ValueError("token job cannot use pool_assets integrity")
+            if (
+                self.token_selector.discovered
+                and self.integrity_mode is not IntegrityMode.SCOPED
+            ):
+                raise ValueError("discovered targets require scoped integrity")
         else:
             if self.pool_selector is None or self.token_selector is not None:
                 raise ValueError("pool job requires pool_selector only")

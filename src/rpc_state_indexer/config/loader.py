@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from rpc_state_indexer.config.models import (
     ChainConfig,
     JobConfig,
     PoolConfig,
+    SweepConfig,
     TokenConfig,
     UniverseConfig,
     normalize_address,
@@ -51,6 +52,14 @@ _UniqueKeyLoader.add_constructor(
 )
 
 
+def _read_yaml_optional(path: Path) -> dict[str, Any]:
+    """Read a catalog file that older chains may not have yet."""
+
+    if not path.is_file():
+        return {}
+    return _read_yaml(path)
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ConfigError(f"configuration file not found: {path}")
@@ -71,10 +80,15 @@ class Catalog:
     pools: dict[str, PoolConfig]
     universes: dict[str, UniverseConfig]
     jobs: dict[str, JobConfig]
+    sweeps: dict[str, SweepConfig] = field(default_factory=dict)
 
     def token_targets(self, job: JobConfig) -> tuple[TokenConfig, ...]:
         selector = job.token_selector
         if selector is None:
+            return ()
+        if selector.discovered:
+            # Resolved at runtime from the sweep candidates; the static catalog
+            # deliberately holds no list for these jobs.
             return ()
         if selector.all_enabled:
             values = [token for token in self.tokens.values() if token.enabled]
@@ -140,6 +154,12 @@ class Catalog:
         chain_value["legacy_execution"].pop("default_batch_size", None)
         job_value = job.model_dump(mode="json")
         job_value.pop("cadence", None)
+        # A static selector resolves the same targets by the same means as it did before
+        # `discovered` existed, so hashing the false flag would invalidate every
+        # already-published row for a no-op. A true flag is a real scope change and stays.
+        selector = job_value.get("token_selector")
+        if isinstance(selector, dict) and not selector.get("discovered"):
+            selector.pop("discovered", None)
         return {
             "chain": chain_value,
             "job": job_value,
@@ -201,6 +221,7 @@ def load_catalog(config_root: Path, chain_name: str) -> Catalog:
     pool_rows = _read_yaml(chain_root / "pools.yaml").get("pools", [])
     universe_rows = _read_yaml(chain_root / "universes.yaml").get("universes", {})
     job_rows = _read_yaml(chain_root / "jobs.yaml").get("jobs", {})
+    sweep_rows = _read_yaml_optional(chain_root / "sweeps.yaml").get("sweeps", {})
 
     token_values = tuple(map(TokenConfig.model_validate, token_rows))
     pool_values = tuple(map(PoolConfig.model_validate, pool_rows))
@@ -216,8 +237,11 @@ def load_catalog(config_root: Path, chain_name: str) -> Catalog:
     jobs = {
         name: JobConfig(name=name, **value) for name, value in job_rows.items()
     }
+    sweeps = {
+        name: SweepConfig(name=name, **value) for name, value in sweep_rows.items()
+    }
 
-    catalog = Catalog(config_root, chain, tokens, pools, universes, jobs)
+    catalog = Catalog(config_root, chain, tokens, pools, universes, jobs, sweeps)
     validate_catalog(catalog)
     return catalog
 
@@ -240,6 +264,19 @@ def validate_catalog(catalog: Catalog) -> None:
         if job.universe is not None and job.universe not in catalog.universes:
             raise ConfigError(f"job {job.name} references unknown universe {job.universe}")
         if job.target_kind == "tokens":
+            selector = job.token_selector
+            if selector is not None and selector.discovered:
+                if job.integrity_mode is not IntegrityMode.SCOPED:
+                    raise ConfigError(
+                        f"job {job.name}: discovered targets require scoped integrity"
+                    )
+                universe = catalog.universes.get(job.universe or "")
+                if universe is None or universe.kind != "explicit_list":
+                    raise ConfigError(
+                        f"job {job.name}: discovered targets require an "
+                        "explicit_list universe"
+                    )
+                continue
             targets = catalog.token_targets(job)
             if not targets:
                 raise ConfigError(f"job {job.name} selects no tokens")
@@ -256,6 +293,22 @@ def validate_catalog(catalog: Catalog) -> None:
                     raise ConfigError(f"job {job.name}: aToken requires scaled_full_supply")
         elif not catalog.pool_targets(job):
             raise ConfigError(f"job {job.name} selects no pools")
+
+    for sweep in catalog.sweeps.values():
+        universe = catalog.universes.get(sweep.universe)
+        if universe is None:
+            raise ConfigError(
+                f"sweep {sweep.name} references unknown universe {sweep.universe}"
+            )
+        # A sweep scans by wallet topics, so its universe must be a closed address list —
+        # never a discovered set (full_holders would make discovery input depend on
+        # discovery output).
+        if universe.kind != "explicit_list":
+            raise ConfigError(
+                f"sweep {sweep.name}: universe {sweep.universe} must be an explicit_list"
+            )
+        if not catalog.explicit_addresses(sweep.universe):
+            raise ConfigError(f"sweep {sweep.name}: universe {sweep.universe} is empty")
 
     for name in catalog.universes:
         catalog._expanded_universe(name, set())

@@ -1,0 +1,21 @@
+tokens:
+# The treasury measurement set is NOT curated here — it comes from the wallet-interaction
+# sweep (sweeps.yaml) via the discovered token selector. This file seeds only the tokens
+# the runtime itself needs: the archive-capability probe reads the oldest enabled token.
+- address: '0x6810e776880c02933d47db1b9fc05908e5386b96'
+  symbol: GNO
+  decimals: 18
+  token_class: standard_erc20
+  # Boundary verified via archive RPC: no code at 3557595, code at 3557596.
+  deployment_block: 3557596
+  date_start: 2017-04-18
+  zero_address_role: event_sentinel
+  balance_function: balanceOf
+  supply_functions:
+  - totalSupply
+  discovery_events:
+  - abi: erc20
+    event: Transfer
+    holder_topics:
+    - 1
+    - 2

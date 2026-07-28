@@ -3,7 +3,7 @@ COMPOSE ?= docker compose
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install-dev check-fast check validate-config run-migrations daemon job status validate probe discover census compute backfill densify bench refresh-catalog
+.PHONY: help install-dev check-fast check validate-config run-migrations daemon job status validate probe discover sweep census compute backfill densify bench refresh-catalog
 
 help:
 	@$(PYTHON) -c "print('Targets: install-dev, check-fast, check, validate-config, run-migrations, daemon, job, status, validate, probe, discover, census, compute, backfill, densify, bench, refresh-catalog')"
@@ -33,7 +33,7 @@ daemon:
 job:
 	$(COMPOSE) --profile jobs run --rm --build jobs $(ARGS)
 
-status validate probe discover census compute backfill densify bench:
+status validate probe discover sweep census compute backfill densify bench:
 	$(COMPOSE) --profile jobs run --rm --build jobs $@ $(ARGS)
 
 # Scheduled incremental catalog refresh: enumerate new pools since the committed watermark

@@ -27,6 +27,7 @@ from rpc_state_indexer.config.models import (
     PoolConfig,
     TokenConfig,
     UniverseConfig,
+    discovered_token_config,
 )
 from rpc_state_indexer.config.validation import validate_runtime_catalog
 from rpc_state_indexer.core.anchors import AnchorResolver
@@ -36,6 +37,7 @@ from rpc_state_indexer.core.census import (
     CensusRunner,
 )
 from rpc_state_indexer.core.discovery_service import DiscoveryService
+from rpc_state_indexer.core.sweep_service import SweepService
 from rpc_state_indexer.core.universes import (
     ClickHouseHolderUniverseRepository,
     UniverseResolver,
@@ -277,6 +279,8 @@ class IndexerService:
         self.repository: ClickHouseRepository | None = None
         self.runtime: RpcRuntime | None = None
         self.guard: WriterGuard | None = None
+        # Discovered targets resolved once per process, keyed by job name.
+        self._discovered: dict[str, tuple[TokenConfig, ...]] = {}
 
     async def open(self) -> IndexerService:
         catalog = build_catalog(self.settings)
@@ -327,6 +331,7 @@ class IndexerService:
             except BaseException as exc:
                 failures.append(("clickhouse", type(exc).__name__))
         self.catalog = None
+        self._discovered.clear()
         if failures:
             _emit(
                 "service_cleanup_failed",
@@ -474,6 +479,66 @@ class IndexerService:
             provider_result_cap=discovery.provider_result_cap,
         )
 
+    def _sweep_service(self) -> SweepService:
+        catalog, repository, runtime = self._required()
+        discovery = catalog.chain.discovery
+        return SweepService(
+            chain_id=catalog.chain.chain_id,
+            rpc=runtime.rpc,
+            store=repository,
+            initial_chunk_size=discovery.initial_chunk_size,
+            provider_result_cap=discovery.provider_result_cap,
+            on_progress=_emit,
+        )
+
+    async def sweep(
+        self,
+        snapshot_date: date,
+        *,
+        sweep_name: str | None = None,
+        anchor: BlockRef | None = None,
+    ) -> BlockRef:
+        catalog, _, _ = self._required()
+        if sweep_name is not None and sweep_name not in catalog.sweeps:
+            raise ServiceError(f"unknown sweep: {sweep_name}")
+        selected = [
+            catalog.sweeps[name]
+            for name in sorted(catalog.sweeps)
+            if (sweep_name is None or name == sweep_name)
+        ]
+        anchor = anchor or await self.resolve_anchor(snapshot_date)
+        service = self._sweep_service()
+        failures: list[str] = []
+        for sweep in selected:
+            if not sweep.enabled:
+                continue
+            wallets = catalog.explicit_addresses(sweep.universe)
+            try:
+                await service.advance(
+                    sweep,
+                    wallets,
+                    anchor_block=anchor.number,
+                    anchor_hash=anchor.block_hash,
+                )
+            except Exception as exc:
+                _emit(
+                    "sweep_failed",
+                    sweep=sweep.name,
+                    error=type(exc).__name__,
+                    detail=str(exc)[:500],
+                )
+                failures.append(f"{sweep.name}: {type(exc).__name__}")
+                continue
+            _emit(
+                "sweep_complete",
+                sweep=sweep.name,
+                wallets=len(wallets),
+                through_block=anchor.number,
+            )
+        if failures:
+            raise JobRunError(failures)
+        return anchor
+
     async def discover(
         self,
         snapshot_date: date,
@@ -557,6 +622,69 @@ class IndexerService:
             code_verifier=runtime.code_verifier,
         )
 
+    def _discovered_targets(self, job: JobConfig) -> tuple[TokenConfig, ...]:
+        """Resolve and register the discovered candidate set once per process.
+
+        The candidate set is fixed for the run (the sweep is a separate writer and the
+        single-writer guard forbids a concurrent one), so a multi-date backfill would
+        otherwise re-resolve and re-register the same thousand targets on every date.
+        """
+
+        cached = self._discovered.get(job.name)
+        if cached is not None:
+            return cached
+        catalog, repository, _ = self._required()
+        targets: dict[str, TokenConfig] = {}
+        for address, first_seen_block in repository.discovered_token_candidates(
+            catalog.chain.chain_id
+        ):
+            curated = catalog.tokens.get(address)
+            if curated is not None:
+                # Curated metadata wins over synthesis; a deliberately disabled entry
+                # is the operator kill-switch for a broken or malicious contract.
+                if curated.enabled:
+                    targets[address] = curated
+                else:
+                    _emit("discovered_target_disabled", job=job.name, token=address)
+                continue
+            targets[address] = discovered_token_config(address, first_seen_block)
+        resolved = tuple(targets[address] for address in sorted(targets))
+        if resolved:
+            # Publications only surface through views once target + config hash are
+            # registered, so registration must precede the first census of a target.
+            CatalogRegistrar(repository, catalog).register_targets(job, resolved)
+        _emit("discovered_targets_resolved", job=job.name, count=len(resolved))
+        self._discovered[job.name] = resolved
+        return resolved
+
+    def _token_targets(self, job: JobConfig) -> tuple[TokenConfig, ...]:
+        """Resolve a token job's targets: static catalog or runtime-discovered."""
+
+        catalog, repository, _ = self._required()
+        selector = job.token_selector
+        if selector is None:
+            return ()
+        if not selector.discovered:
+            return catalog.token_targets(job)
+        resolved = self._discovered_targets(job)
+        # Quarantine is re-read per call, never cached: a target that starts failing
+        # part-way through a long backfill must drop out for the remaining dates.
+        quarantined = repository.quarantined_token_targets(
+            catalog.chain.chain_id,
+            job.name,
+            self.settings.discovered_quarantine_threshold,
+        )
+        if not quarantined:
+            return resolved
+        live = tuple(token for token in resolved if token.address not in quarantined)
+        _emit(
+            "discovered_targets_quarantined",
+            job=job.name,
+            count=len(resolved) - len(live),
+            threshold=self.settings.discovered_quarantine_threshold,
+        )
+        return live
+
     async def census(
         self,
         snapshot_date: date,
@@ -572,7 +700,7 @@ class IndexerService:
         failures: list[str] = []
         for job in self._jobs(job_name):
             if job.target_kind == "tokens":
-                for token in catalog.token_targets(job):
+                for token in self._token_targets(job):
                     if not self._active(token, snapshot_date, anchor.number):
                         continue
                     if repository.publication_exists(
@@ -730,6 +858,39 @@ async def run_discover(
         await service.discover(through or _yesterday(), job_name=job)
     finally:
         await service.close()
+
+
+async def run_sweep(
+    *,
+    settings: RuntimeSettings,
+    through: date | None,
+    sweep: str | None,
+) -> None:
+    # A first sweep spans years of history, so expose /live, /ready, /metrics for its
+    # duration exactly as the backfill does. Readiness tracks the single-writer heartbeat.
+    service: IndexerService | None = None
+    health: HealthServer | None = None
+    try:
+        health = start_health_server(
+            settings.metrics_port,
+            readiness_probe=lambda: service is not None
+            and service.guard is not None
+            and service.guard.healthy,
+        )
+    except Exception as exc:
+        _emit("health_server_start_failed", error=type(exc).__name__)
+        health = None
+    try:
+        service = await _with_service(settings, "sweep")
+        await service.sweep(through or _yesterday(), sweep_name=sweep)
+    finally:
+        if service is not None:
+            await service.close()
+        if health is not None:
+            try:
+                health.close()
+            except Exception as exc:
+                _emit("health_server_stop_failed", error=type(exc).__name__)
 
 
 async def run_census(
@@ -900,6 +1061,13 @@ async def run_daemon(*, settings: RuntimeSettings) -> None:
             service.guard.ensure_healthy()
             DAEMON_CYCLES.inc()
             target = _yesterday()
+            if service.catalog is not None and service.catalog.sweeps:
+                try:
+                    await service.sweep(target)
+                except JobRunError as exc:
+                    DAEMON_JOB_FAILURES.labels("sweep").inc()
+                    _emit("daemon_sweep_failed", failure_count=len(exc.failures))
+                service.guard.ensure_healthy()
             for job in service._jobs(None):
                 if job.cadence != "daily":
                     continue

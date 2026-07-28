@@ -18,3 +18,4 @@ Convention: [`README.md`](README.md).
 - [indexer-two-layer-architecture](memory/indexer-two-layer-architecture.md) — verified ingestion collectors vs derived compute modules; CL ingestion + compute layer shipped.
 - [catalog-incremental-refresh](memory/catalog-incremental-refresh.md) — watermarked `enumerate --incremental` + additive `assemble` + `make refresh-catalog`; per-target hash keeps it reindex-safe.
 - [deployment-and-observability](memory/deployment-and-observability.md) — GHCR CI, Terraform/EKS deploy in the infra repo, new metrics, Grafana dashboard + alerts; CLICKHOUSE_USER + daemon-scoping gotchas.
+- [treasury-sweep-pipeline](memory/treasury-sweep-pipeline.md) — discovery-driven treasury tracking: wallet sweep → discovered token selector → scoped census; only the wallet CSV is curated.

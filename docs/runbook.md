@@ -3,6 +3,38 @@
 This runbook covers the implemented CLI and daemon. Commands are shown for a local
 virtual environment first, with Docker equivalents where useful.
 
+## Treasury tracking: sweep → discovered targets
+
+The treasury pipeline is discovery-driven — the only fixed input is the wallet list
+(`config/<chain>/vendored/treasury_addresses.csv`); the token set is never curated.
+
+1. **Sweep** (`rpc-state-indexer sweep`, or automatically at the start of each daemon
+   cycle): address-less `eth_getLogs` scans find every event any contract emitted with a
+   treasury wallet in an indexed topic position (`config/<chain>/sweeps.yaml`). Coverage
+   is gap-free per (wallet, topic position); raw hits land in `wallet_interaction_logs`,
+   coverage in `sweep_ranges`. Adding a wallet to the CSV backfills only that wallet.
+   A gap is scanned in `checkpoint_blocks`-sized windows (default 100k), each committed
+   before the next starts — so memory stays bounded, an interrupted sweep resumes from
+   its last committed window, and progress is visible as `sweep_window_indexed` events
+   (`window`/`windows` = position within the run). `/live`, `/ready`, `/metrics` are
+   served on `METRICS_PORT` for the duration.
+2. **Candidates**: `v_sweep_candidate_tokens` classifies transfer-shaped hits (erc20 /
+   erc20_weth9 / erc721 / erc1155); `v_sweep_candidate_protocols` lists every other
+   contract × event signature the wallets touched — the evidence queue for future
+   measurement adapters.
+3. **Measurement**: `daily_treasury` uses `token_selector: {discovered: true}` — at
+   census time it resolves every fungible candidate, prefers curated `tokens.yaml`
+   metadata where an address overlaps (a *disabled* curated entry is the operator
+   kill-switch), synthesizes a scoped ERC20 target otherwise, registers target + config
+   hash, and measures exact pinned `balanceOf` per wallet. A target whose last N census
+   attempts all failed (spam gas-bombs; `DISCOVERED_QUARANTINE_THRESHOLD`, default 3) is
+   excluded from new batches — surfaced via the `discovered_targets_quarantined` event,
+   never coerced to zero.
+
+Chains: `CHAIN=gnosis` (default) or `CHAIN=ethereum` — same ClickHouse database, rows key
+on `chain_id`; run one writer per chain. Check sweep health via `v_sweep_failures` and
+the `sweep_failed` / `sweep_complete` log events.
+
 ## 1. Prerequisites
 
 Provide:

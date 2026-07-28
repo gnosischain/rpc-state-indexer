@@ -1,0 +1,7 @@
+sweeps:
+  treasury_interactions:
+    universe: treasury
+    topic_positions: [1, 2, 3]
+    # Pre-dates the GnosisDAO launch (Nov 2020, ~block 11.22M) with margin; earlier
+    # blocks cannot hold treasury interactions, so scanning them is wasted work only.
+    start_block: 11000000

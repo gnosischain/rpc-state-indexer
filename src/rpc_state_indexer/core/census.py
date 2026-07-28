@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -19,6 +20,7 @@ from rpc_state_indexer.collectors import (
     PoolReserveCollector,
     TokenCollectionResult,
 )
+from rpc_state_indexer.collectors.atoken import UINT256_MAX
 from rpc_state_indexer.collectors.models import CollectionBatchEvidence, CollectionError
 from rpc_state_indexer.config.hashing import canonical_hash, canonical_json
 from rpc_state_indexer.config.loader import Catalog
@@ -172,43 +174,66 @@ class CatalogRegistrar:
         self.catalog = catalog
 
     def register(self) -> None:
-        now = datetime.now(UTC)
         configs: list[dict[str, Any]] = []
         for job in self.catalog.jobs.values():
-            targets: tuple[TokenConfig | PoolConfig, ...]
-            target_kind: str
             if job.target_kind == "tokens":
-                targets = self.catalog.token_targets(job)
-                target_kind = "token"
+                configs.extend(
+                    self._rows(job, self.catalog.token_targets(job), "token")
+                )
             else:
-                targets = self.catalog.pool_targets(job)
-                target_kind = "pool"
-            for target in targets:
-                effective = self.catalog.target_effective_config(job, target)
-                coverage_candidates = tuple(
-                    value
-                    for value in (job.coverage_start, target.date_start)
-                    if value is not None
-                )
-                configs.append(
-                    {
-                        "chain_id": self.catalog.chain.chain_id,
-                        "job_name": job.name,
-                        "target_kind": target_kind,
-                        "target_address": target.address,
-                        "cadence": job.cadence,
-                        "integrity_mode": job.integrity_mode.value,
-                        "coverage_start": (
-                            max(coverage_candidates) if coverage_candidates else None
-                        ),
-                        "coverage_end": target.date_end,
-                        "config_hash": canonical_hash(effective),
-                        "canonical_config_json": canonical_json(effective),
-                        "enabled": int(target.enabled),
-                        "registered_at": now,
-                    }
-                )
+                configs.extend(self._rows(job, self.catalog.pool_targets(job), "pool"))
         self.store.register_configs(configs)
+
+    def register_targets(
+        self,
+        job: JobConfig,
+        targets: Sequence[TokenConfig | PoolConfig],
+    ) -> None:
+        """Register runtime-resolved targets (discovered selectors) for a job.
+
+        Publications only surface through views when their exact target + config hash is
+        registered, so discovered targets must be registered before their first census.
+        """
+
+        target_kind = "token" if job.target_kind == "tokens" else "pool"
+        rows = self._rows(job, tuple(targets), target_kind)
+        if rows:
+            self.store.register_configs(rows)
+
+    def _rows(
+        self,
+        job: JobConfig,
+        targets: tuple[TokenConfig | PoolConfig, ...],
+        target_kind: str,
+    ) -> list[dict[str, Any]]:
+        now = datetime.now(UTC)
+        configs: list[dict[str, Any]] = []
+        for target in targets:
+            effective = self.catalog.target_effective_config(job, target)
+            coverage_candidates = tuple(
+                value
+                for value in (job.coverage_start, target.date_start)
+                if value is not None
+            )
+            configs.append(
+                {
+                    "chain_id": self.catalog.chain.chain_id,
+                    "job_name": job.name,
+                    "target_kind": target_kind,
+                    "target_address": target.address,
+                    "cadence": job.cadence,
+                    "integrity_mode": job.integrity_mode.value,
+                    "coverage_start": (
+                        max(coverage_candidates) if coverage_candidates else None
+                    ),
+                    "coverage_end": target.date_end,
+                    "config_hash": canonical_hash(effective),
+                    "canonical_config_json": canonical_json(effective),
+                    "enabled": int(target.enabled),
+                    "registered_at": now,
+                }
+            )
+        return configs
 
 
 class CensusRunner:
@@ -794,6 +819,12 @@ class CensusRunner:
         else:
             observed_sum = sum(row.balance_raw for row in result.balances)
             reference_supply = scalar_values.get("totalSupply")
+        if observed_sum > UINT256_MAX:
+            # Every individual balance is a valid uint256 return, but their sum is not
+            # bounded by uint256 — only an adversarial or broken supply reaches this.
+            # Fail closed with a named reason instead of letting the UInt256 column
+            # raise an opaque serialization error after the attempt was marked verified.
+            raise PublicationBlocked(["observed_sum_overflow"])
         finished = datetime.now(UTC)
         verified_state = {
             **base,

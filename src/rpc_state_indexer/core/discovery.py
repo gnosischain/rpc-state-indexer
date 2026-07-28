@@ -59,6 +59,62 @@ class BlockRange:
         return BlockRange(self.start, middle), BlockRange(middle, self.end_exclusive)
 
 
+TopicConstraint = tuple[str, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class LogFilter:
+    """An eth_getLogs scope: optional contract address, positional topic OR-lists.
+
+    ``topics[i]`` constrains topic index ``i`` (0 = the event signature). ``None`` leaves
+    a position unconstrained. At least one position must be constrained — an entirely
+    unconstrained filter would sweep every log on the chain.
+    """
+
+    address: str | None
+    topics: tuple[TopicConstraint, ...]
+
+    def __post_init__(self) -> None:
+        if self.address is not None and not _ADDRESS_RE.fullmatch(self.address):
+            raise ValueError("filter address must be normalized lowercase 0x hex")
+        if len(self.topics) > 4:
+            raise ValueError("a log has at most four topics")
+        if all(constraint is None for constraint in self.topics):
+            raise ValueError("filter must constrain at least one topic position")
+        for constraint in self.topics:
+            if constraint is None:
+                continue
+            if not constraint:
+                raise ValueError("a topic constraint cannot be empty")
+            for topic in constraint:
+                if not _HASH_RE.fullmatch(topic) or topic != topic.lower():
+                    raise ValueError("topic constraints must be lowercase 32-byte words")
+
+    def params(self, block_range: BlockRange) -> dict[str, Any]:
+        topics: list[list[str] | None] = [
+            list(constraint) if constraint is not None else None
+            for constraint in self.topics
+        ]
+        while topics and topics[-1] is None:
+            topics.pop()
+        value: dict[str, Any] = {
+            "topics": topics,
+            "fromBlock": hex(block_range.start),
+            "toBlock": hex(block_range.end_exclusive - 1),
+        }
+        if self.address is not None:
+            value["address"] = self.address
+        return value
+
+    def matches_topics(self, topics: tuple[str, ...]) -> bool:
+        for position, constraint in enumerate(self.topics):
+            if constraint is None:
+                continue
+            if position >= len(topics) or topics[position] not in constraint:
+                return False
+        return True
+
+
 @dataclass(frozen=True, slots=True)
 class NormalizedLog:
     address: str
@@ -143,14 +199,16 @@ def _parse_hash(value: object, field: str) -> str:
 def _parse_log(
     value: object,
     *,
-    expected_address: str,
-    expected_topic0: str,
+    log_filter: LogFilter,
     requested_range: BlockRange,
 ) -> NormalizedLog:
     if not isinstance(value, Mapping):
         raise DiscoveryResponseError("eth_getLogs entry must be an object")
-    address = value.get("address")
-    if not isinstance(address, str) or address.lower() != expected_address:
+    raw_address = value.get("address")
+    if not isinstance(raw_address, str) or not _ADDRESS_RE.fullmatch(raw_address.lower()):
+        raise DiscoveryResponseError("log address is not a canonical EVM address")
+    address = raw_address.lower()
+    if log_filter.address is not None and address != log_filter.address:
         raise DiscoveryResponseError("eth_getLogs returned an unexpected contract address")
     removed = value.get("removed")
     if type(removed) is not bool:
@@ -162,8 +220,8 @@ def _parse_log(
     if not isinstance(raw_topics, list) or not raw_topics:
         raise DiscoveryResponseError("eth_getLogs entry has no topics")
     topics = tuple(_parse_hash(topic, "topic") for topic in raw_topics)
-    if topics[0] != expected_topic0:
-        raise DiscoveryResponseError("eth_getLogs returned an unexpected topic0")
+    if not log_filter.matches_topics(topics):
+        raise DiscoveryResponseError("eth_getLogs returned a log outside the topic filter")
 
     data = value.get("data")
     if not isinstance(data, str) or not _HEX_DATA_RE.fullmatch(data):
@@ -177,8 +235,8 @@ def _parse_log(
     )
     log_index = _parse_quantity(value.get("logIndex"), "logIndex")
     return NormalizedLog(
-        address=expected_address,
-        topic0=expected_topic0,
+        address=address,
+        topic0=topics[0],
         topics=topics,
         data=data.lower(),
         block_number=block_number,
@@ -297,21 +355,12 @@ class StrictLogScanner:
 
     async def _read_range(
         self,
-        token_address: str,
-        topic0: str,
+        log_filter: LogFilter,
         block_range: BlockRange,
     ) -> tuple[list[object], RpcEndpoint]:
-        params = [
-            {
-                "address": token_address,
-                "topics": [topic0],
-                "fromBlock": hex(block_range.start),
-                "toBlock": hex(block_range.end_exclusive - 1),
-            }
-        ]
         raw, endpoint = await self._rpc.call(
             "eth_getLogs",
-            params,
+            [log_filter.params(block_range)],
             historical_block=block_range.end_exclusive - 1,
         )
         if not isinstance(raw, list):
@@ -329,6 +378,19 @@ class StrictLogScanner:
         if not _ADDRESS_RE.fullmatch(token_address):
             raise ValueError("token_address must be normalized lowercase 0x hex")
         normalized_topic0 = _parse_hash(topic0, "topic0")
+        return await self.scan_filter(
+            log_filter=LogFilter(address=token_address, topics=((normalized_topic0,),)),
+            start_block=start_block,
+            end_block_exclusive=end_block_exclusive,
+        )
+
+    async def scan_filter(
+        self,
+        *,
+        log_filter: LogFilter,
+        start_block: int,
+        end_block_exclusive: int,
+    ) -> DiscoveryScan:
         requested = BlockRange(start_block, end_block_exclusive)
 
         pending: list[BlockRange] = []
@@ -345,11 +407,7 @@ class StrictLogScanner:
         while pending:
             block_range = pending.pop()
             try:
-                raw_logs, endpoint = await self._read_range(
-                    token_address,
-                    normalized_topic0,
-                    block_range,
-                )
+                raw_logs, endpoint = await self._read_range(log_filter, block_range)
             except RpcProviderLimit as exc:
                 if block_range.size == 1:
                     raise DiscoveryRangeFailed(
@@ -380,8 +438,7 @@ class StrictLogScanner:
             parsed = [
                 _parse_log(
                     item,
-                    expected_address=token_address,
-                    expected_topic0=normalized_topic0,
+                    log_filter=log_filter,
                     requested_range=block_range,
                 )
                 for item in raw_logs
@@ -408,6 +465,7 @@ __all__ = [
     "DiscoveryRangeFailed",
     "DiscoveryResponseError",
     "DiscoveryScan",
+    "LogFilter",
     "NormalizedLog",
     "StrictLogScanner",
     "contiguous_frontier",

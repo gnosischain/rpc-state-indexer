@@ -1,4 +1,5 @@
 .env
+.env.ethereum
 .venv/
 __pycache__/
 .pytest_cache/
