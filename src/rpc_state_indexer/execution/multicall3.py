@@ -58,6 +58,7 @@ class Multicall3Executor:
         address: str,
         deployment_block: int,
         batch_size: int = 250,
+        max_parallel_batches: int = 8,
     ) -> None:
         self.rpc = rpc
         self.address = address.lower()
@@ -65,6 +66,9 @@ class Multicall3Executor:
         self.batch_size = batch_size
         if batch_size < 1:
             raise ValueError("batch size must be positive")
+        if max_parallel_batches < 1:
+            raise ValueError("max parallel batches must be positive")
+        self.max_parallel_batches = max_parallel_batches
 
     async def execute(
         self,
@@ -75,9 +79,27 @@ class Multicall3Executor:
             raise UnsupportedExecutionRange("Multicall3 is not deployed at the anchor")
         if anchor.number == 0:
             raise UnsupportedExecutionRange("Multicall sentinels require anchor block > 0")
+
+        groups = list(chunked(calls, self.batch_size))
+        if len(groups) == 1:
+            return list(await self._execute_adaptive(groups[0], anchor))
+
+        # Batches are independent units of verification: each carries its own
+        # block/timestamp/parent-hash sentinels at head and tail and is proven on its own,
+        # so running them concurrently cannot weaken any guarantee. Executing them serially
+        # left the RPC client's concurrency semaphore idle and made a full-holder census
+        # (tens of batches) take tens of seconds of pure round-trip latency.
+        #
+        # gather preserves input order, which batch_sequence depends on. The wave bound
+        # keeps the number of pending coroutines sane for very large universes; actual
+        # in-flight requests are already capped by the client's own semaphore.
         output: list[VerifiedBatchResult] = []
-        for group in chunked(calls, self.batch_size):
-            output.extend(await self._execute_adaptive(group, anchor))
+        for start in range(0, len(groups), self.max_parallel_batches):
+            wave = groups[start : start + self.max_parallel_batches]
+            for batch_results in await asyncio.gather(
+                *(self._execute_adaptive(group, anchor) for group in wave)
+            ):
+                output.extend(batch_results)
         return output
 
     async def _execute_adaptive(

@@ -73,6 +73,9 @@ def build_rpc_runtime(settings: RuntimeSettings, catalog: Catalog) -> RpcRuntime
         address=multicall_config.address,
         deployment_block=multicall_config.deployment_block,
         batch_size=settings.multicall_batch_size,
+        # Independent batches go out together; the client's own semaphore and rate limiter
+        # remain the real ceiling, so this just stops them from sitting idle.
+        max_parallel_batches=settings.rpc_concurrency,
     )
     legacy = LegacyRpcBatchExecutor(
         rpc,
