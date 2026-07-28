@@ -33,7 +33,9 @@ class RuntimeSettings(BaseSettings):
     clickhouse_port: int = Field(default=8443, alias="CLICKHOUSE_PORT")
     clickhouse_user: str = Field(default="default", alias="CLICKHOUSE_USER")
     clickhouse_password: SecretStr = Field(default=SecretStr(""), alias="CLICKHOUSE_PASSWORD")
-    clickhouse_database: str = Field(default="rpc_indexer", alias="CLICKHOUSE_DATABASE")
+    clickhouse_database: str = Field(
+        default="rpc_state_indexer", alias="CLICKHOUSE_DATABASE"
+    )
     clickhouse_secure: bool = Field(default=True, alias="CLICKHOUSE_SECURE")
     clickhouse_verify: bool = Field(default=True, alias="CLICKHOUSE_VERIFY")
 

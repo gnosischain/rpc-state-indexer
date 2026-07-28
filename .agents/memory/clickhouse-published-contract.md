@@ -5,7 +5,7 @@ updated: 2026-07-21
 ---
 
 Storage is ClickHouse only (database from `CLICKHOUSE_DATABASE`, currently
-`rpc_indexer_gnosis`). The **only** consumer-facing contract is the publication-gated
+`rpc_state_indexer`). The **only** consumer-facing contract is the publication-gated
 views defined in `migrations/007_views.sql`:
 
 - `v_token_balances_published`, `v_token_scalars_published`, `v_pool_token_balances_published`

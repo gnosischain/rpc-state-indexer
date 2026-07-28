@@ -22,7 +22,7 @@ cow-indexer. Migration `kubernetes_job` (`args=["migrate"]`, gated `run_migratio
 PodMonitor. Secrets via ESO from SSM ParameterStore: `analytics-preview-rpc-state-indexer`
 (clickhouseHost/User/Password) + `-rpc` (rpcUrls, providerGroups). Probes `/live` + `/ready` :9090.
 `terraform validate` passes (only `kubernetes_job`→`_v1` deprecation warnings, same as cow). DB is
-`rpc_indexer_gnosis` (wiped + re-migrated clean 000–010 for launch).
+`rpc_state_indexer` (wiped + re-migrated clean 000–010 for launch).
 
 **Gotchas:**
 - The app reads **`CLICKHOUSE_USER`** (cow reads `CLICKHOUSE_USERNAME`) and single comma-separated
