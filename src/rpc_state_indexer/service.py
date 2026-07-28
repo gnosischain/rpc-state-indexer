@@ -676,8 +676,16 @@ class IndexerService:
         )
         return written
 
-    async def _resolve_metadata_once(self, anchor: BlockRef) -> None:
-        """One metadata pass per process, and only when a job actually needs it."""
+    async def _resolve_metadata_once(self) -> None:
+        """One metadata pass per process, and only when a job actually needs it.
+
+        The census anchor is deliberately NOT used. A backfill starts years in the past,
+        where most discovered tokens have no code yet, so reading symbol()/decimals()
+        there returns nothing and writes a permanent-looking 'failed' row for a token that
+        is perfectly readable today. Metadata is immutable once deployed, so it is read at
+        the most recent finalized anchor instead — still pinned and reproducible, but at a
+        block where the contracts actually exist.
+        """
 
         if self._metadata_pass_done:
             return
@@ -690,7 +698,10 @@ class IndexerService:
             self._metadata_pass_done = True
             return
         try:
-            await self.resolve_token_metadata(anchor)
+            # Read at the most recent finalized day-anchor, regardless of which date the
+            # census is currently working on.
+            recent = await self.resolve_anchor(_yesterday())
+            await self.resolve_token_metadata(recent)
         except Exception as exc:
             # Never let labelling break measurement.
             _emit(
@@ -774,7 +785,7 @@ class IndexerService:
         anchor = await self.resolve_anchor(snapshot_date)
         # All full-holder discovery completes before any full-supply publication.
         await self.discover(snapshot_date, job_name=job_name, anchor=anchor)
-        await self._resolve_metadata_once(anchor)
+        await self._resolve_metadata_once()
         runner = self._runner()
         attempts: list[UUID] = []
         failures: list[str] = []
