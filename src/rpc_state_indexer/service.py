@@ -20,6 +20,7 @@ from rpc_state_indexer.collectors import (
     Erc20Collector,
     PoolReserveCollector,
 )
+from rpc_state_indexer.collectors.metadata import TokenMetadataCollector
 from rpc_state_indexer.compute import REGISTRY as COMPUTE_REGISTRY
 from rpc_state_indexer.config.loader import Catalog
 from rpc_state_indexer.config.models import (
@@ -281,6 +282,8 @@ class IndexerService:
         self.guard: WriterGuard | None = None
         # Discovered targets resolved once per process, keyed by job name.
         self._discovered: dict[str, tuple[TokenConfig, ...]] = {}
+        # Metadata is per-token, not per-date: one pass per process is enough.
+        self._metadata_pass_done = False
 
     async def open(self) -> IndexerService:
         catalog = build_catalog(self.settings)
@@ -622,6 +625,82 @@ class IndexerService:
             code_verifier=runtime.code_verifier,
         )
 
+    async def resolve_token_metadata(
+        self,
+        anchor: BlockRef,
+        *,
+        chunk_size: int = 80,
+    ) -> int:
+        """Read symbol/name/decimals for discovered tokens that lack them.
+
+        Metadata is an observation keyed by (chain_id, token_address), never folded back
+        into the catalog — so resolving it later cannot move any target's config_hash, and
+        it enriches already-published history retroactively through the consumer view.
+
+        Best-effort by design: this must never be able to fail a census. A token whose
+        metadata cannot be read still has an exact balance; only its label degrades.
+        """
+
+        catalog, repository, runtime = self._required()
+        chain_id = catalog.chain.chain_id
+        candidates = [
+            address for address, _ in repository.discovered_token_candidates(chain_id)
+        ]
+        if not candidates:
+            return 0
+        pending = repository.unresolved_metadata_addresses(chain_id, candidates)
+        if not pending:
+            return 0
+        collector = TokenMetadataCollector(runtime.executor, chain_id=chain_id)
+        written = 0
+        for start in range(0, len(pending), chunk_size):
+            chunk = pending[start : start + chunk_size]
+            try:
+                observed = await collector.resolve(chunk, anchor)
+            except Exception as exc:
+                _emit(
+                    "token_metadata_chunk_failed",
+                    count=len(chunk),
+                    error=type(exc).__name__,
+                    detail=str(exc)[:300],
+                )
+                continue
+            if observed:
+                repository.insert_token_metadata([item.as_row() for item in observed])
+                written += len(observed)
+        _emit(
+            "token_metadata_resolved",
+            pending=len(pending),
+            written=written,
+            anchor_block=anchor.number,
+        )
+        return written
+
+    async def _resolve_metadata_once(self, anchor: BlockRef) -> None:
+        """One metadata pass per process, and only when a job actually needs it."""
+
+        if self._metadata_pass_done:
+            return
+        catalog, _, _ = self._required()
+        needs_metadata = any(
+            job.token_selector is not None and job.token_selector.discovered
+            for job in catalog.jobs.values()
+        )
+        if not needs_metadata:
+            self._metadata_pass_done = True
+            return
+        try:
+            await self.resolve_token_metadata(anchor)
+        except Exception as exc:
+            # Never let labelling break measurement.
+            _emit(
+                "token_metadata_pass_failed",
+                error=type(exc).__name__,
+                detail=str(exc)[:300],
+            )
+        finally:
+            self._metadata_pass_done = True
+
     def _discovered_targets(self, job: JobConfig) -> tuple[TokenConfig, ...]:
         """Resolve and register the discovered candidate set once per process.
 
@@ -695,6 +774,7 @@ class IndexerService:
         anchor = await self.resolve_anchor(snapshot_date)
         # All full-holder discovery completes before any full-supply publication.
         await self.discover(snapshot_date, job_name=job_name, anchor=anchor)
+        await self._resolve_metadata_once(anchor)
         runner = self._runner()
         attempts: list[UUID] = []
         failures: list[str] = []

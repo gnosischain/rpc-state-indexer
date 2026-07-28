@@ -88,6 +88,11 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "chain_id", "token_address", "holder_address", "source", "source_detail",
         "first_seen_block", "last_seen_block", "observations",
     ),
+    "token_metadata": (
+        "chain_id", "token_address", "symbol", "name", "decimals",
+        "resolution_status", "symbol_encoding", "name_encoding", "anchor_block",
+        "anchor_hash", "error_class", "error_message", "observed_at",
+    ),
     "sweep_ranges": (
         "chain_id", "wallet_address", "topic_position", "range_start_block",
         "range_end_block_exclusive", "scan_id", "status", "anchor_block", "anchor_hash",
@@ -251,6 +256,36 @@ class ClickHouseRepository:
             (int(row["range_start_block"]), int(row["range_end_block_exclusive"]))
             for row in rows
         ]
+
+    def insert_token_metadata(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        return self.insert_rows("token_metadata", rows)
+
+    def unresolved_metadata_addresses(
+        self,
+        chain_id: int,
+        addresses: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Of ``addresses``, those with no fully-resolved metadata row yet.
+
+        Partial and failed rows are retried: a token can start answering after a proxy
+        upgrade, and a transient RPC failure must not permanently label it unknown.
+        """
+
+        candidates = tuple(sorted(set(addresses)))
+        if not candidates:
+            return ()
+        rows = self.query_rows(
+            f"""
+            SELECT token_address
+            FROM {self.database}.token_metadata FINAL
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND resolution_status = 'resolved'
+              AND token_address IN {{addresses:Array(String)}}
+            """,
+            {"chain_id": chain_id, "addresses": list(candidates)},
+        )
+        resolved = {str(row["token_address"]) for row in rows}
+        return tuple(address for address in candidates if address not in resolved)
 
     def insert_sweep_ranges(self, rows: Iterable[Mapping[str, Any]]) -> int:
         return self.insert_rows("sweep_ranges", rows)
