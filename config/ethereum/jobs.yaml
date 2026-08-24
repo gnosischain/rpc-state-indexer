@@ -1,6 +1,6 @@
-# Mainnet runs treasury tracking only: the token set is resolved at runtime from the
-# wallet-interaction sweep (never curated here), scoped to the treasury universe. No
-# full_holders discovery jobs on mainnet.
+# Mainnet runs treasury tracking plus the GNO-supply wallet census. The treasury
+# token set is resolved at runtime from the wallet-interaction sweep (never curated
+# here), scoped to the treasury universe. No full_holders discovery jobs on mainnet.
 jobs:
   daily_treasury:
     target_kind: tokens
@@ -10,3 +10,17 @@ jobs:
     cadence: daily
     integrity_mode: scoped
     coverage_start: null
+  # WL-036: daily mainnet-GNO balances of the 4 supply-defining wallets (3 vesting
+  # + Omnibridge escrow), replacing the Dune GNO-supply feed. Explicit token
+  # selector on purpose — no sweep dependency, and the job's effective hash stays
+  # independent of treasury's vendored CSV. coverage_start = chain-1 day-anchor
+  # start, so the coverage calendar reflects the intended backfill window.
+  daily_gno_supply_wallets:
+    target_kind: tokens
+    token_selector:
+      addresses:
+      - '0x6810e776880c02933d47db1b9fc05908e5386b96'
+    universe: gno_supply_wallets
+    cadence: daily
+    integrity_mode: scoped
+    coverage_start: 2020-11-01
