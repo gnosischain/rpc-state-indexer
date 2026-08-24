@@ -3,8 +3,10 @@ universes:
     kind: explicit_list
     source: vendored/treasury_addresses.csv
     address_column: address
-  # GNO-supply census wallets (WL-036): the 3 vesting/lock contracts plus the
-  # Omnibridge escrow whose mainnet GNO balances define the Non-Circ. and
+  # GNO-supply census wallets (WL-036): the 3 vesting/lock contracts, the
+  # Omnibridge escrow, and the zero address (GNO transferred to 0x0 stays in
+  # balanceOf(0x0) — the contract never reduces totalSupply — and counts as
+  # burned, ~3.15M GNO). Their mainnet GNO balances define the Non-Circ. and
   # Ethereum Circ. supply series. Deliberately a separate universe/vendored file
   # from treasury: appending to treasury_addresses.csv would change the vendored
   # hash of every treasury target and de-publish its history.

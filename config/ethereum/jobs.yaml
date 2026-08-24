@@ -10,11 +10,12 @@ jobs:
     cadence: daily
     integrity_mode: scoped
     coverage_start: null
-  # WL-036: daily mainnet-GNO balances of the 4 supply-defining wallets (3 vesting
-  # + Omnibridge escrow), replacing the Dune GNO-supply feed. Explicit token
-  # selector on purpose — no sweep dependency, and the job's effective hash stays
-  # independent of treasury's vendored CSV. coverage_start = chain-1 day-anchor
-  # start, so the coverage calendar reflects the intended backfill window.
+  # WL-036: daily mainnet-GNO balances of the 5 supply-defining addresses (3
+  # vesting + Omnibridge escrow + the zero address, whose balance is the burned
+  # supply), replacing the Dune GNO-supply feed. Explicit token selector on
+  # purpose — no sweep dependency, and the job's effective hash stays independent
+  # of treasury's vendored CSV. coverage_start = chain-1 day-anchor start, so the
+  # coverage calendar reflects the intended backfill window.
   daily_gno_supply_wallets:
     target_kind: tokens
     token_selector:
