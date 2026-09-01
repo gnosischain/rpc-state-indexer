@@ -229,12 +229,22 @@ class WriterGuard:
             except BaseException as exc:
                 failures.append(exc)
         if self._acquired:
-            try:
-                self._write(datetime.fromtimestamp(0, UTC), "released")
-            except BaseException as exc:
-                failures.append(exc)
-            finally:
-                self._acquired = False
+            # A failed release leaves the last "active" beat looking fresh, which
+            # locks every successor out for stale_seconds and turns one death into
+            # a restart loop — retry briefly before giving up.
+            released = False
+            release_error: BaseException | None = None
+            for attempt in range(5):
+                try:
+                    self._write(datetime.fromtimestamp(0, UTC), "released")
+                    released = True
+                    break
+                except BaseException as exc:
+                    release_error = exc
+                    await asyncio.sleep(min(2.0 * (attempt + 1), 6.0))
+            self._acquired = False
+            if not released and release_error is not None:
+                failures.append(release_error)
         if failures:
             kinds = ", ".join(type(exc).__name__ for exc in failures)
             raise ServiceError(f"writer guard cleanup failed ({kinds})")
@@ -267,9 +277,26 @@ class WriterGuard:
 
     async def _heartbeat_loop(self) -> None:
         interval = max(10.0, self.stale_seconds / 3)
+        last_success = time.monotonic()
         while True:
             await asyncio.sleep(interval)
-            self._write(datetime.now(UTC), "active")
+            try:
+                self._write(datetime.now(UTC), "active")
+                last_success = time.monotonic()
+            except Exception as exc:
+                # A transient insert failure (e.g. a saturated ClickHouse rejecting
+                # the write) must not kill the writer: while the last successful
+                # beat is younger than the staleness window no other writer can
+                # acquire, so the lock is still held and it is safe to keep going.
+                # Once the outage spans the window the lock is genuinely
+                # contestable — then dying is the only safe option.
+                if time.monotonic() - last_success >= self.stale_seconds:
+                    raise
+                _emit(
+                    "writer_heartbeat_write_failed",
+                    error=type(exc).__name__,
+                    seconds_since_success=round(time.monotonic() - last_success, 1),
+                )
 
 
 class IndexerService:
