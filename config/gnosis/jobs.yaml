@@ -16,6 +16,20 @@ jobs:
     cadence: daily
     integrity_mode: scoped
     coverage_start: null
+  # GNO-only supply scalar (WL-037): the api:gno_supply endpoint needs the GNO
+  # totalSupply history current NOW, while the full daily_token_supply catalog
+  # backfill (~3.4k tokens x a year) takes days under server saturation. One
+  # token, one call per day — its backfill completes in minutes and the daemon
+  # keeps it current forward. Consumers dedup across both job names.
+  daily_gno_supply_scalar:
+    target_kind: tokens
+    token_selector:
+      addresses:
+      - '0x9c58bacc331c9aa871afd802db6379a98e80cedb'
+    universe: supply_probe
+    cadence: daily
+    integrity_mode: scoped
+    coverage_start: 2020-08-23
   daily_curated_balances:
     target_kind: tokens
     token_selector:
