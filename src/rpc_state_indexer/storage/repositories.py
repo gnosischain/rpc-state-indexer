@@ -506,18 +506,31 @@ class ClickHouseRepository:
         return self.insert_rows("writer_heartbeats", [row])
 
     def fresh_writer_processes(
-        self, chain_id: int, stale_seconds: int
+        self,
+        chain_id: int,
+        stale_seconds: int,
+        *,
+        discovery_scope: bool = False,
     ) -> tuple[str, ...]:
+        # Two lock classes share the heartbeat table: `discover` writes only
+        # discovery-side tables and conflicts only with other discovery writers;
+        # every other operation writes census-side tables and conflicts with each
+        # other. A row's class derives from its recorded operation.
         rows = self.query_rows(
             f"""
             SELECT toString(process_id) AS process_id
             FROM {self.database}.writer_heartbeats FINAL
             WHERE chain_id = {{chain_id:UInt64}}
+              AND (operation = 'discover') = {{discovery_scope:UInt8}}
               AND heartbeat_at >= now64(9)
                   - toIntervalSecond({{stale_seconds:UInt64}})
             ORDER BY process_id
             """,
-            {"chain_id": chain_id, "stale_seconds": stale_seconds},
+            {
+                "chain_id": chain_id,
+                "stale_seconds": stale_seconds,
+                "discovery_scope": int(discovery_scope),
+            },
         )
         return tuple(str(row["process_id"]) for row in rows)
 

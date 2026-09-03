@@ -174,8 +174,21 @@ def _emit(event: str, **fields: object) -> None:
     print(json.dumps({"event": event, **fields}, sort_keys=True, default=str), flush=True)
 
 
+# Operations that write ONLY discovery-side tables (discovery_ranges,
+# holder_observations, plus idempotent day-anchor persistence). They take a
+# separate lock class so heavy discovery can run beside the census daemon:
+# census-side single-writer semantics are untouched, and concurrent duplicate
+# discovery work is tolerated by design (coverage is gap-based and append-only).
+_DISCOVERY_SCOPE_OPERATIONS = frozenset({"discover"})
+
+
 class WriterGuard:
-    """Coarse single-writer guard backed by append-only heartbeats."""
+    """Coarse single-writer-per-class guard backed by append-only heartbeats.
+
+    Two lock classes exist per chain: "discovery" (the operations in
+    _DISCOVERY_SCOPE_OPERATIONS) and "census" (everything else). Writers conflict
+    only within their own class.
+    """
 
     def __init__(
         self,
@@ -188,6 +201,7 @@ class WriterGuard:
         self.repository = repository
         self.chain_id = chain_id
         self.operation = operation
+        self.discovery_scope = operation in _DISCOVERY_SCOPE_OPERATIONS
         self.stale_seconds = stale_seconds
         self.process_id = uuid4()
         self.started_at = datetime.now(UTC)
@@ -196,7 +210,7 @@ class WriterGuard:
 
     async def acquire(self) -> None:
         active = self.repository.fresh_writer_processes(
-            self.chain_id, self.stale_seconds
+            self.chain_id, self.stale_seconds, discovery_scope=self.discovery_scope
         )
         if active:
             raise ServiceError(
@@ -205,7 +219,7 @@ class WriterGuard:
         self._write(datetime.now(UTC), "active")
         self._acquired = True
         after = self.repository.fresh_writer_processes(
-            self.chain_id, self.stale_seconds
+            self.chain_id, self.stale_seconds, discovery_scope=self.discovery_scope
         )
         own = str(self.process_id)
         if any(process != own for process in after):
