@@ -816,6 +816,67 @@ class IndexerService:
         )
         return live
 
+
+    def _record_target_failure(
+        self,
+        *,
+        job_name: str,
+        target_kind: str,
+        target_address: str,
+        target_label: str,
+        snapshot_date: date,
+        exc: BaseException,
+    ) -> None:
+        """Persist and log a per-target census failure.
+
+        Without this a failing target is invisible: the census loop only counted it,
+        and run_backfill discarded the reason, so a target that fails deterministically
+        (as 5 of daily_curated_balances' 58 did on 2026-08-31) could not be diagnosed
+        from the logs or the warehouse at all. Best-effort by design — a failure to
+        record a failure must never mask the original one.
+        """
+
+        _emit(
+            "census_target_failed",
+            job=job_name,
+            target=target_label,
+            snapshot_date=snapshot_date,
+            error=type(exc).__name__,
+            detail=str(exc)[:500],
+        )
+        repository = self.repository
+        catalog = self.catalog
+        if repository is None or catalog is None:
+            return
+        try:
+            repository.insert_terminal_errors(
+                [
+                    {
+                        "chain_id": catalog.chain.chain_id,
+                        "job_name": job_name,
+                        "target_kind": target_kind,
+                        "target_address": target_address,
+                        "snapshot_date": snapshot_date,
+                        "attempt_id": uuid4(),
+                        "subject_address": "",
+                        "call_kind": "target",
+                        "batch_sequence": 0,
+                        "error_class": type(exc).__name__,
+                        "rpc_code": 0,
+                        "return_data": "0x",
+                        "error_message": str(exc)[:4096],
+                        "terminal_at": datetime.now(UTC),
+                    }
+                ]
+            )
+        except Exception as record_exc:
+            _emit(
+                "census_target_failure_unrecorded",
+                job=job_name,
+                target=target_label,
+                error=type(record_exc).__name__,
+            )
+
     async def census(
         self,
         snapshot_date: date,
@@ -856,6 +917,14 @@ class IndexerService:
                         )
                     except Exception as exc:
                         CENSUS_PUBLICATIONS.labels(job.name, "token", "failed").inc()
+                        self._record_target_failure(
+                            job_name=job.name,
+                            target_kind="token",
+                            target_address=token.address,
+                            target_label=token.symbol,
+                            snapshot_date=snapshot_date,
+                            exc=exc,
+                        )
                         failures.append(
                             f"{job.name}/{token.symbol}: {type(exc).__name__}"
                         )
@@ -888,6 +957,14 @@ class IndexerService:
                         )
                     except Exception as exc:
                         CENSUS_PUBLICATIONS.labels(job.name, "pool", "failed").inc()
+                        self._record_target_failure(
+                            job_name=job.name,
+                            target_kind="pool",
+                            target_address=pool.address,
+                            target_label=pool.name,
+                            snapshot_date=snapshot_date,
+                            exc=exc,
+                        )
                         failures.append(
                             f"{job.name}/{pool.name}: {type(exc).__name__}"
                         )
@@ -1070,10 +1147,14 @@ async def run_backfill(
                 await service.census(snapshot_date, job_name=job)
             except JobRunError as exc:
                 failed.append(f"{snapshot_date}({len(exc.failures)})")
+                # Carry the per-target reasons, not just the count: a bare count sends
+                # the reader to a table that (before census_target_failed existed) had
+                # nothing in it either.
                 _emit(
                     "backfill_date_failed",
                     snapshot_date=snapshot_date,
                     failure_count=len(exc.failures),
+                    failures=exc.failures[:30],
                 )
             except Exception as exc:
                 # A non-JobRunError (e.g. a transient ClickHouse connection drop during a Cloud
