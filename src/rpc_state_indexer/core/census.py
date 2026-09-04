@@ -300,9 +300,6 @@ class CensusRunner:
         await asyncio.to_thread(
             self.store.insert_attempt_state, {**base, "status": "started"}
         )
-        await asyncio.to_thread(
-            self._persist_universe, attempt_id, job, token.address, snapshot_date, universe
-        )
         try:
             await self._verify_token_code(token, anchor, executor_kind)
             collector = self.atoken_collector if token.is_atoken else self.erc20_collector
@@ -318,11 +315,13 @@ class CensusRunner:
             SUSPECT_ZEROS.labels(token=token.symbol).inc(0)
             for error in result.errors:
                 CENSUS_CALL_FAILURES.labels(reason=error.status.value).inc()
+            # Universe, observations and the publish (with its read-backs) run in ONE
+            # worker-thread call: one thread, one thread-local client, one connection,
+            # one replica — so the read-backs see this attempt's own inserts without a
+            # cross-replica consistency wait (which under concurrency stalls on every
+            # other target's inserts too: 38ms -> 600ms per read-back).
             await asyncio.to_thread(
-                self._persist_token_result, attempt_id, job, token, snapshot_date, result
-            )
-            await asyncio.to_thread(
-                self._publish_token,
+                self._persist_and_publish_token,
                 base, attempt_id, job, token, snapshot_date, universe, result,
             )
         except BaseException as exc:
@@ -383,10 +382,7 @@ class CensusRunner:
                     pool=pool, anchor=anchor, integrity_mode=job.integrity_mode
                 )
                 await asyncio.to_thread(
-                    self._persist_pool_cl_result, attempt_id, job, pool, snapshot_date, cl_result
-                )
-                await asyncio.to_thread(
-                    self._publish_pool_cl,
+                    self._persist_and_publish_pool_cl,
                     base, attempt_id, job, pool, snapshot_date, universe, cl_result,
                 )
                 return attempt_id
@@ -407,10 +403,7 @@ class CensusRunner:
                     pool=pool, anchor=anchor, integrity_mode=job.integrity_mode
                 )
             await asyncio.to_thread(
-                self._persist_pool_result, attempt_id, job, pool, snapshot_date, result
-            )
-            await asyncio.to_thread(
-                self._publish_pool,
+                self._persist_and_publish_pool,
                 base, attempt_id, job, pool, snapshot_date, universe, result,
             )
         except BaseException as exc:
@@ -426,6 +419,52 @@ class CensusRunner:
             )
             raise
         return attempt_id
+
+    def _persist_and_publish_token(
+        self,
+        base: dict[str, Any],
+        attempt_id: UUID,
+        job: JobConfig,
+        token: TokenConfig,
+        snapshot_date: date,
+        universe: FrozenUniverse,
+        result: TokenCollectionResult,
+    ) -> None:
+        """Insert this attempt's rows and publish them on the calling thread.
+
+        Must stay a single synchronous unit: the publish read-backs are only
+        guaranteed to see the inserts if both go through the same client.
+        """
+
+        self._persist_universe(attempt_id, job, token.address, snapshot_date, universe)
+        self._persist_token_result(attempt_id, job, token, snapshot_date, result)
+        self._publish_token(base, attempt_id, job, token, snapshot_date, universe, result)
+
+    def _persist_and_publish_pool(
+        self,
+        base: dict[str, Any],
+        attempt_id: UUID,
+        job: JobConfig,
+        pool: PoolConfig,
+        snapshot_date: date,
+        universe: FrozenUniverse,
+        result: PoolCollectionResult,
+    ) -> None:
+        self._persist_pool_result(attempt_id, job, pool, snapshot_date, result)
+        self._publish_pool(base, attempt_id, job, pool, snapshot_date, universe, result)
+
+    def _persist_and_publish_pool_cl(
+        self,
+        base: dict[str, Any],
+        attempt_id: UUID,
+        job: JobConfig,
+        pool: PoolConfig,
+        snapshot_date: date,
+        universe: FrozenUniverse,
+        cl_result: PoolClCollectionResult,
+    ) -> None:
+        self._persist_pool_cl_result(attempt_id, job, pool, snapshot_date, cl_result)
+        self._publish_pool_cl(base, attempt_id, job, pool, snapshot_date, universe, cl_result)
 
     @staticmethod
     def _check_date_window(target: TokenConfig | PoolConfig, value: date) -> None:

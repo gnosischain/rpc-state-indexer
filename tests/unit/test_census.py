@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
@@ -300,3 +301,70 @@ async def test_terminal_failure_blocks_publication_and_never_writes_zero() -> No
     assert store.balances == []
     assert len(store.errors) == 1
     assert store.attempts[-1]["status"] == "failed"
+
+
+class ThreadRecordingStore(FakeStore):
+    """Records which thread each persistence/read-back call ran on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.threads: dict[str, list[int]] = {}
+
+    def _mark(self, name: str) -> None:
+        self.threads.setdefault(name, []).append(threading.get_ident())
+
+    def insert_attempt_state(self, row: Mapping[str, Any]) -> int:
+        self._mark("attempt_state")
+        return super().insert_attempt_state(row)
+
+    def insert_universe_members(self, rows: list[dict[str, Any]], **kwargs: Any) -> int:
+        self._mark("universe")
+        return super().insert_universe_members(rows, **kwargs)
+
+    def insert_token_balances(self, rows: list[dict[str, Any]], **kwargs: Any) -> int:
+        self._mark("balances")
+        return super().insert_token_balances(rows, **kwargs)
+
+    def insert_token_scalars(self, rows: list[dict[str, Any]], **kwargs: Any) -> int:
+        self._mark("scalars")
+        return super().insert_token_scalars(rows, **kwargs)
+
+    def readback_universe_digest(self, scope: AttemptScope) -> str:
+        self._mark("readback_universe")
+        return super().readback_universe_digest(scope)
+
+    def readback_token_digest(self, scope: AttemptScope) -> str:
+        self._mark("readback_token")
+        return super().readback_token_digest(scope)
+
+    def append_publication(self, row: Mapping[str, Any]) -> int:
+        self._mark("publication")
+        return super().append_publication(row)
+
+
+@pytest.mark.asyncio
+async def test_attempt_rows_and_their_readbacks_share_one_thread() -> None:
+    # Read-your-writes across ClickHouse Cloud replicas is guaranteed only when the
+    # inserts and the read-backs go through the same client, i.e. the same thread.
+    # A split across worker threads blocked ~43% of publications in production.
+    store = ThreadRecordingStore()
+    subject, job, token = runner(store, FakeCollector())
+
+    await subject.run_token(job, token, date(2026, 7, 18), ANCHOR)
+
+    assert len(store.publications) == 1
+    bound = {
+        name: store.threads[name]
+        for name in (
+            "universe",
+            "balances",
+            "scalars",
+            "readback_universe",
+            "readback_token",
+            "publication",
+        )
+    }
+    idents = {ident for calls in bound.values() for ident in calls}
+    assert len(idents) == 1, bound
+    # ...and none of it ran on the event-loop thread.
+    assert threading.get_ident() not in idents

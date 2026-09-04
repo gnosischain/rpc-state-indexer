@@ -1,8 +1,10 @@
-"""Read-back queries must request read-after-write consistency.
+"""Where the cross-replica consistency wait is (and is not) applied.
 
-Under concurrent targets an attempt's rows are inserted through one per-thread
-client and read back through another, i.e. possibly a different replica; without
-select_sequential_consistency the digest check blocked ~43% of good publications.
+Per-attempt read-backs get read-after-write structurally — insert and read-back
+share one thread, client and connection — so they must NOT carry
+select_sequential_consistency: applied there it stalled every read-back behind
+all concurrent inserts (38 ms -> 600 ms) and capped throughput. The once-per-job
+publication prefetch is the one place the wait belongs.
 """
 
 from datetime import date
@@ -54,7 +56,7 @@ SCOPE = AttemptScope(
 )
 
 
-def test_every_readback_asks_for_sequential_consistency() -> None:
+def test_per_attempt_readbacks_do_not_wait_for_replication() -> None:
     client = CapturingClient()
     repository = ClickHouseRepository(client, "db")
 
@@ -63,13 +65,22 @@ def test_every_readback_asks_for_sequential_consistency() -> None:
     repository.readback_token_digest(SCOPE)
     repository.readback_pool_digest(SCOPE)
     repository.readback_cl_digest(SCOPE)
+
+    assert len(client.calls) == 7  # token and cl read-backs issue two queries each
+    for call in client.calls:
+        assert "settings" not in call, call["sql"][:60]
+
+
+def test_publication_prefetch_waits_for_replication() -> None:
+    client = CapturingClient()
+    repository = ClickHouseRepository(client, "db")
+
     repository.published_target_addresses(
         chain_id=100, job_name="j", target_kind="token", snapshot_date=date(2026, 8, 1)
     )
 
-    assert len(client.calls) == 8  # token and cl read-backs issue two queries each
-    for call in client.calls:
-        assert call.get("settings") == {"select_sequential_consistency": 1}, call["sql"][:60]
+    assert len(client.calls) == 1
+    assert client.calls[0]["settings"] == {"select_sequential_consistency": 1}
 
 
 def test_plain_queries_do_not_carry_the_setting() -> None:
