@@ -93,7 +93,13 @@ class Catalog:
         if selector.all_enabled:
             values = [token for token in self.tokens.values() if token.enabled]
         elif selector.addresses:
-            values = [self.tokens[address] for address in selector.addresses]
+            # An explicit list is still subject to `enabled`: a disabled entry must
+            # drop out of every job, not only the class/all selectors.
+            values = [
+                self.tokens[address]
+                for address in selector.addresses
+                if self.tokens[address].enabled
+            ]
         else:
             selected = set(selector.class_in)
             values = [
@@ -109,7 +115,11 @@ class Catalog:
         if selector.all_enabled:
             values = [pool for pool in self.pools.values() if pool.enabled]
         elif selector.addresses:
-            values = [self.pools[address] for address in selector.addresses]
+            values = [
+                self.pools[address]
+                for address in selector.addresses
+                if self.pools[address].enabled
+            ]
         else:
             selected = set(selector.class_in)
             values = [

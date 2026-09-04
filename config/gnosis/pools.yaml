@@ -869,6 +869,7 @@ pools:
   - token: '0xaf204776c7245bf4147c2612bf6e5972ee483701'
   - token: '0xc7b46bdc1e71921f996ed38cbd11361a3fc3a80b'
 - address: '0x6df2d655927a1df83d1a4785fbab23be5ab79e58'
+  enabled: false  # asset token has no code on Gnosis (2026-09-04); pool census fails ContractNotDeployed
   name: uniswap_v3
   pool_class: uniswap_v3
   deployment_block: 46632496
@@ -883,6 +884,7 @@ pools:
   - token: '0x038f46af46241faf26c15ffbce96ec28273d197c'
   - token: '0xaf204776c7245bf4147c2612bf6e5972ee483701'
 - address: '0xf2c2cb6bc3941e4e58cf3466d2856971d25fe034'
+  enabled: false  # asset token has no code on Gnosis (2026-09-04); pool census fails ContractNotDeployed
   name: uniswap_v3
   pool_class: uniswap_v3
   deployment_block: 46642278

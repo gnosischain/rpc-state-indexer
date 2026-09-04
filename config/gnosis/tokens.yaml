@@ -17816,6 +17816,7 @@ tokens:
     - 1
     - 2
 - address: '0x78dbaef6b63f8a772dce51f0fb45510fdf286598'
+  enabled: false  # no code and no events ever on Gnosis (2026-09-04); every census fails ContractNotDeployed
   symbol: '?'
   decimals: 18
   token_class: standard_erc20
@@ -17948,6 +17949,7 @@ tokens:
     - 1
     - 2
 - address: '0x7943ad9681f94adbb80cf7cf899508c32f39236a'
+  enabled: false  # no code and no events ever on Gnosis (2026-09-04); every census fails ContractNotDeployed
   symbol: '?'
   decimals: 18
   token_class: standard_erc20
@@ -37469,6 +37471,7 @@ tokens:
   deployment_block: 35656508
   discovery_events: *id001
 - address: '0x8ad3c73f833d3f9a523ab01476625f269aeb7cf0'
+  enabled: false  # no code and no events ever on Gnosis (2026-09-04); every census fails ContractNotDeployed
   symbol: TSLAX
   decimals: 18
   token_class: standard_erc20
