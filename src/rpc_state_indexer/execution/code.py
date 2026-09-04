@@ -45,6 +45,11 @@ class HistoricalCodeVerifier:
             raise ValueError("number-provider quorum must be at least two")
         self.rpc = rpc
         self.number_provider_quorum = number_provider_quorum
+        # Evidence is a pure function of (address, anchor block hash, expected hash), so
+        # it is cached per anchor. Without this the Multicall3 contract was re-read once
+        # per target — an identical eth_getCode ~3,400 times per date. Only successes
+        # are cached: a transient RPC failure must not be remembered as a verdict.
+        self._cache: dict[str, dict[tuple[str, str | None], CodeEvidence]] = {}
 
     async def verify(
         self,
@@ -54,6 +59,25 @@ class HistoricalCodeVerifier:
         expected_code_hash: str | None = None,
     ) -> CodeEvidence:
         normalized = address.lower()
+        cache_key = (normalized, expected_code_hash)
+        bucket = self._cache.get(anchor.block_hash)
+        if bucket is not None and cache_key in bucket:
+            return bucket[cache_key]
+        evidence = await self._verify_uncached(normalized, anchor, expected_code_hash)
+        if bucket is None:
+            # Keep only the current anchor's evidence: a backfill walks hundreds of
+            # anchors and must not accumulate every one of them.
+            self._cache = {anchor.block_hash: {}}
+            bucket = self._cache[anchor.block_hash]
+        bucket[cache_key] = evidence
+        return evidence
+
+    async def _verify_uncached(
+        self,
+        normalized: str,
+        anchor: BlockRef,
+        expected_code_hash: str | None,
+    ) -> CodeEvidence:
         try:
             endpoint = await self.rpc.endpoint_pool.select(
                 historical_block=anchor.number, require_eip1898=True
