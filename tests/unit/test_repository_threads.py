@@ -16,7 +16,7 @@ class FakeClient:
         self.closed = False
         self.rows = rows or []
 
-    def query(self, _sql: str, parameters: dict[str, Any] | None = None) -> Any:
+    def query(self, _sql: str, **_kwargs: Any) -> Any:
         rows = self.rows
 
         class Result:
