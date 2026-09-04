@@ -115,4 +115,8 @@ def clickhouse_connection_settings(
 def build_repository(settings: RuntimeSettings) -> ClickHouseRepository:
     connection = clickhouse_connection_settings(settings)
     client = create_clickhouse_client(connection)
-    return ClickHouseRepository(client, settings.clickhouse_database)
+    return ClickHouseRepository(
+        client,
+        settings.clickhouse_database,
+        client_factory=lambda: create_clickhouse_client(connection),
+    )

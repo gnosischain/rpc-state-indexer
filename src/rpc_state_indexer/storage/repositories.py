@@ -7,7 +7,8 @@ attempts; there are no UPDATE, DELETE, mutation, or partition-replacement helper
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -165,9 +166,53 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
 
 
 class ClickHouseRepository:
-    def __init__(self, client: Any, database: str) -> None:
-        self.client = client
+    """Append-only persistence over one ClickHouse database.
+
+    clickhouse-connect clients are not safe to share across threads ("use a separate
+    client instance per thread/process"). Census bookkeeping runs its blocking
+    ClickHouse calls in worker threads so targets can overlap, so each thread lazily
+    gets its own client from ``client_factory``; the thread that built the repository
+    keeps the original client. Without a factory the repository behaves exactly as
+    before: one client, used wherever it is called from.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        database: str,
+        *,
+        client_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        self._owner_client = client
+        self._client_factory = client_factory
+        self._owner_thread = threading.get_ident()
+        self._local = threading.local()
+        self._thread_clients: list[Any] = []
+        self._thread_clients_lock = threading.Lock()
         self.database = validate_database_name(database)
+
+    @property
+    def client(self) -> Any:
+        if self._client_factory is None or threading.get_ident() == self._owner_thread:
+            return self._owner_client
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = self._client_factory()
+            self._local.client = client
+            with self._thread_clients_lock:
+                self._thread_clients.append(client)
+        return client
+
+    def close_all(self) -> None:
+        """Close the owner client and every per-thread client this repository created."""
+
+        with self._thread_clients_lock:
+            clients = [self._owner_client, *self._thread_clients]
+            self._thread_clients = []
+        for client in clients:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
     def ping(self) -> bool:
         self.client.command("SELECT 1")
@@ -472,6 +517,40 @@ class ClickHouseRepository:
 
     def append_publication(self, row: Mapping[str, Any]) -> int:
         return self.insert_rows("census_publications", [row])
+
+    def published_target_addresses(
+        self,
+        *,
+        chain_id: int,
+        job_name: str,
+        target_kind: str,
+        snapshot_date: date,
+    ) -> frozenset[str]:
+        """Every target already published for one (job, kind, date), lowercased.
+
+        One query per job instead of one ``publication_exists`` per target: that
+        point lookup is routed through three view layers (a GROUP BY with ten argMax
+        and a registry JOIN) and measured at ~185 ms — asked ~3,400 times per date it
+        was the single largest line of a census run.
+        """
+
+        rows = self.query_rows(
+            f"""
+            SELECT lower(target_address) AS target_address
+            FROM {self.database}.v_publications_current
+            WHERE chain_id = {{chain_id:UInt64}}
+              AND job_name = {{job_name:String}}
+              AND target_kind = {{target_kind:String}}
+              AND snapshot_date = {{snapshot_date:Date}}
+            """,
+            {
+                "chain_id": chain_id,
+                "job_name": job_name,
+                "target_kind": target_kind,
+                "snapshot_date": snapshot_date,
+            },
+        )
+        return frozenset(str(row["target_address"]) for row in rows)
 
     def publication_exists(
         self,
