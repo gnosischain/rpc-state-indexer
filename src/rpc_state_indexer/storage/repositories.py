@@ -249,7 +249,10 @@ class ClickHouseRepository:
 
         columns = [column for column in TABLE_COLUMNS[table] if column in supplied]
         data = [[row[column] for column in columns] for row in materialized]
-        settings: dict[str, Any] = {"async_insert": 0}
+        if table in self._ASYNC_INSERT_TABLES and deduplication_token is None:
+            settings: dict[str, Any] = dict(self._ASYNC_INSERT_SETTINGS)
+        else:
+            settings = {"async_insert": 0}
         if deduplication_token is not None:
             if not deduplication_token:
                 raise ValueError("deduplication token cannot be empty")
@@ -624,6 +627,25 @@ class ClickHouseRepository:
     # stalled each one behind all concurrent inserts (38 ms -> 600 ms) and capped
     # throughput.
     _CONSISTENT_READ_SETTINGS: Mapping[str, Any] = {"select_sequential_consistency": 1}
+
+    # Tables whose rows are never read back before a publication and never gate one:
+    # they can be inserted asynchronously, letting the server coalesce many small
+    # inserts and returning to the caller without waiting for the flush. Per target
+    # that removes two of six serial ClickHouse round-trips (attempt "started" and
+    # "verified"/"failed"). Everything read back (universe, observations, errors),
+    # the publication row (read by the next run's prefetch) and the writer heartbeat
+    # (the lock) stay synchronous.
+    #
+    # Ordering under async batching: census_attempts is ReplacingMergeTree keyed on
+    # insert_version = now64(9) at flush time, so a "started" and a "verified" row of
+    # one attempt that share a flush tie on version, and ReplacingMergeTree then keeps
+    # the last-inserted row of the part. Both rows come from one thread and one
+    # connection in order, so "verified" always wins; rows in different flushes carry
+    # strictly increasing versions. wait_for_async_insert=0 means a server-side crash
+    # could drop a buffered attempt-state row — acceptable for bookkeeping that gates
+    # nothing, and the reason this set must never grow to a gating table.
+    _ASYNC_INSERT_TABLES: frozenset[str] = frozenset({"census_attempts"})
+    _ASYNC_INSERT_SETTINGS: Mapping[str, Any] = {"async_insert": 1, "wait_for_async_insert": 0}
 
     def query_rows(
         self,
