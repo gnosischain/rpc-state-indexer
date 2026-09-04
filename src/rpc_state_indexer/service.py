@@ -8,9 +8,10 @@ import json
 import socket
 import time
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 from uuid import UUID, uuid4
 
 from rpc_state_indexer.collectors import (
@@ -325,6 +326,7 @@ class IndexerService:
         self._discovered: dict[str, tuple[TokenConfig, ...]] = {}
         # Metadata is per-token, not per-date: one pass per process is enough.
         self._metadata_pass_done = False
+        self._executor: ThreadPoolExecutor | None = None
 
     async def open(self) -> IndexerService:
         catalog = build_catalog(self.settings)
@@ -334,6 +336,14 @@ class IndexerService:
             repository = build_repository(self.settings)
             self.repository = repository
             repository.ping()
+            # Census bookkeeping runs its blocking ClickHouse calls via asyncio.to_thread;
+            # the loop's default executor (min(32, cpus + 4), i.e. ~6 on a 2-CPU pod) would
+            # otherwise cap the effective target concurrency well below the setting.
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.settings.census_target_concurrency + 4,
+                thread_name_prefix="census",
+            )
+            asyncio.get_running_loop().set_default_executor(self._executor)
             self.runtime = build_rpc_runtime(self.settings, catalog)
             self.guard = WriterGuard(
                 repository,
@@ -369,11 +379,19 @@ class IndexerService:
         self.repository = None
         if repository is not None:
             try:
-                close = getattr(repository.client, "close", None)
-                if callable(close):
-                    close()
+                close_all = getattr(repository, "close_all", None)
+                if callable(close_all):
+                    close_all()
+                else:
+                    close = getattr(repository.client, "close", None)
+                    if callable(close):
+                        close()
             except BaseException as exc:
                 failures.append(("clickhouse", type(exc).__name__))
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
         self.catalog = None
         self._discovered.clear()
         if failures:
@@ -891,18 +909,62 @@ class IndexerService:
         runner = self._runner()
         attempts: list[UUID] = []
         failures: list[str] = []
+        limit = asyncio.Semaphore(self.settings.census_target_concurrency)
+
+        async def run_one(
+            job: JobConfig,
+            target_kind: str,
+            target: TokenConfig | PoolConfig,
+            label: str,
+        ) -> tuple[UUID | None, str | None]:
+            async with limit:
+                try:
+                    if target_kind == "token":
+                        attempt = await runner.run_token(
+                            job, cast(TokenConfig, target), snapshot_date, anchor
+                        )
+                    else:
+                        attempt = await runner.run_pool(
+                            job, cast(PoolConfig, target), snapshot_date, anchor
+                        )
+                except Exception as exc:
+                    CENSUS_PUBLICATIONS.labels(job.name, target_kind, "failed").inc()
+                    await asyncio.to_thread(
+                        self._record_target_failure,
+                        job_name=job.name,
+                        target_kind=target_kind,
+                        target_address=target.address,
+                        target_label=label,
+                        snapshot_date=snapshot_date,
+                        exc=exc,
+                    )
+                    return None, f"{job.name}/{label}: {type(exc).__name__}"
+            CENSUS_PUBLICATIONS.labels(job.name, target_kind, "published").inc()
+            _emit(
+                "census_published",
+                job=job.name,
+                target=label,
+                snapshot_date=snapshot_date,
+                attempt_id=attempt,
+            )
+            return attempt, None
+
         for job in self._jobs(job_name):
+            target_kind = "token" if job.target_kind == "tokens" else "pool"
+            # One prefetch per job replaces one publication_exists per target.
+            published = await asyncio.to_thread(
+                repository.published_target_addresses,
+                chain_id=catalog.chain.chain_id,
+                job_name=job.name,
+                target_kind=target_kind,
+                snapshot_date=snapshot_date,
+            )
+            work: list[tuple[TokenConfig | PoolConfig, str]] = []
             if job.target_kind == "tokens":
                 for token in self._token_targets(job):
                     if not self._active(token, snapshot_date, anchor.number):
                         continue
-                    if repository.publication_exists(
-                        chain_id=catalog.chain.chain_id,
-                        job_name=job.name,
-                        target_kind="token",
-                        target_address=token.address,
-                        snapshot_date=snapshot_date,
-                    ):
+                    if token.address.lower() in published:
                         CENSUS_PUBLICATIONS.labels(job.name, "token", "skipped").inc()
                         _emit(
                             "census_skipped_published",
@@ -911,73 +973,25 @@ class IndexerService:
                             snapshot_date=snapshot_date,
                         )
                         continue
-                    try:
-                        attempt = await runner.run_token(
-                            job, token, snapshot_date, anchor
-                        )
-                    except Exception as exc:
-                        CENSUS_PUBLICATIONS.labels(job.name, "token", "failed").inc()
-                        self._record_target_failure(
-                            job_name=job.name,
-                            target_kind="token",
-                            target_address=token.address,
-                            target_label=token.symbol,
-                            snapshot_date=snapshot_date,
-                            exc=exc,
-                        )
-                        failures.append(
-                            f"{job.name}/{token.symbol}: {type(exc).__name__}"
-                        )
-                        continue
-                    attempts.append(attempt)
-                    CENSUS_PUBLICATIONS.labels(job.name, "token", "published").inc()
-                    _emit(
-                        "census_published",
-                        job=job.name,
-                        target=token.symbol,
-                        snapshot_date=snapshot_date,
-                        attempt_id=attempt,
-                    )
+                    work.append((token, token.symbol))
             else:
                 for pool in catalog.pool_targets(job):
                     if not self._active(pool, snapshot_date, anchor.number):
                         continue
-                    if repository.publication_exists(
-                        chain_id=catalog.chain.chain_id,
-                        job_name=job.name,
-                        target_kind="pool",
-                        target_address=pool.address,
-                        snapshot_date=snapshot_date,
-                    ):
+                    if pool.address.lower() in published:
                         CENSUS_PUBLICATIONS.labels(job.name, "pool", "skipped").inc()
                         continue
-                    try:
-                        attempt = await runner.run_pool(
-                            job, pool, snapshot_date, anchor
-                        )
-                    except Exception as exc:
-                        CENSUS_PUBLICATIONS.labels(job.name, "pool", "failed").inc()
-                        self._record_target_failure(
-                            job_name=job.name,
-                            target_kind="pool",
-                            target_address=pool.address,
-                            target_label=pool.name,
-                            snapshot_date=snapshot_date,
-                            exc=exc,
-                        )
-                        failures.append(
-                            f"{job.name}/{pool.name}: {type(exc).__name__}"
-                        )
-                        continue
+                    work.append((pool, pool.name))
+            # gather preserves input order, so attempts/failures stay in target order
+            # exactly as the serial loop produced them.
+            results = await asyncio.gather(
+                *(run_one(job, target_kind, target, label) for target, label in work)
+            )
+            for attempt, failure in results:
+                if attempt is not None:
                     attempts.append(attempt)
-                    CENSUS_PUBLICATIONS.labels(job.name, "pool", "published").inc()
-                    _emit(
-                        "census_published",
-                        job=job.name,
-                        target=pool.name,
-                        snapshot_date=snapshot_date,
-                        attempt_id=attempt,
-                    )
+                if failure is not None:
+                    failures.append(failure)
         if failures:
             raise JobRunError(failures)
         return attempts

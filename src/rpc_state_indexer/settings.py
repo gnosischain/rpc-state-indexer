@@ -59,6 +59,12 @@ class RuntimeSettings(BaseSettings):
     # Comma-separated job names the daemon runs each cycle; empty = every daily job. Use this to
     # scope a single daemon away from the full multi-thousand-target catalog.
     daemon_jobs: str = Field(default="", alias="DAEMON_JOBS")
+    # Targets censused concurrently within one job. Each target is ~13 sequential
+    # network round-trips (mostly ClickHouse bookkeeping at 30-185 ms each), so serial
+    # processing was latency-bound at <1 target/s regardless of RPC concurrency.
+    census_target_concurrency: int = Field(
+        default=16, alias="CENSUS_TARGET_CONCURRENCY", ge=1, le=256
+    )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @field_validator("clickhouse_database")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections import defaultdict
 from collections.abc import Sequence
@@ -271,7 +272,11 @@ class CensusRunner:
         if job.universe is None:
             raise ValueError("token census requires a universe selector")
         self._check_date_window(token, snapshot_date)
-        universe = self.universe_resolver.resolve(
+        # Every blocking ClickHouse call on this path runs in a worker thread so that
+        # concurrent targets overlap their ~13 sequential round-trips instead of
+        # serialising them on the event loop. The helpers themselves stay synchronous.
+        universe = await asyncio.to_thread(
+            self.universe_resolver.resolve,
             job.universe,
             token_address=token.address,
             anchor_block=anchor.number,
@@ -292,9 +297,11 @@ class CensusRunner:
             executor_kind,
             started,
         )
-        self.store.insert_attempt_state({**base, "status": "started"})
-        self._persist_universe(
-            attempt_id, job, token.address, snapshot_date, universe
+        await asyncio.to_thread(
+            self.store.insert_attempt_state, {**base, "status": "started"}
+        )
+        await asyncio.to_thread(
+            self._persist_universe, attempt_id, job, token.address, snapshot_date, universe
         )
         try:
             await self._verify_token_code(token, anchor, executor_kind)
@@ -311,21 +318,23 @@ class CensusRunner:
             SUSPECT_ZEROS.labels(token=token.symbol).inc(0)
             for error in result.errors:
                 CENSUS_CALL_FAILURES.labels(reason=error.status.value).inc()
-            self._persist_token_result(
-                attempt_id, job, token, snapshot_date, result
+            await asyncio.to_thread(
+                self._persist_token_result, attempt_id, job, token, snapshot_date, result
             )
-            self._publish_token(
-                base, attempt_id, job, token, snapshot_date, universe, result
+            await asyncio.to_thread(
+                self._publish_token,
+                base, attempt_id, job, token, snapshot_date, universe, result,
             )
         except BaseException as exc:
-            self.store.insert_attempt_state(
+            await asyncio.to_thread(
+                self.store.insert_attempt_state,
                 {
                     **base,
                     "status": "failed",
                     "error_class": type(exc).__name__,
                     "error_message": str(exc)[:4096],
                     "finished_at": datetime.now(UTC),
-                }
+                },
             )
             raise
         return attempt_id
@@ -356,7 +365,9 @@ class CensusRunner:
             executor_kind,
             started,
         )
-        self.store.insert_attempt_state({**base, "status": "started"})
+        await asyncio.to_thread(
+            self.store.insert_attempt_state, {**base, "status": "started"}
+        )
         try:
             await self.code_verifier.verify(pool.address, anchor)
             for asset in pool.assets:
@@ -371,9 +382,12 @@ class CensusRunner:
                 cl_result = await self.cl_collector.collect(
                     pool=pool, anchor=anchor, integrity_mode=job.integrity_mode
                 )
-                self._persist_pool_cl_result(attempt_id, job, pool, snapshot_date, cl_result)
-                self._publish_pool_cl(
-                    base, attempt_id, job, pool, snapshot_date, universe, cl_result
+                await asyncio.to_thread(
+                    self._persist_pool_cl_result, attempt_id, job, pool, snapshot_date, cl_result
+                )
+                await asyncio.to_thread(
+                    self._publish_pool_cl,
+                    base, attempt_id, job, pool, snapshot_date, universe, cl_result,
                 )
                 return attempt_id
             if pool.is_balancer:
@@ -392,21 +406,23 @@ class CensusRunner:
                 result = await self.pool_collector.collect(
                     pool=pool, anchor=anchor, integrity_mode=job.integrity_mode
                 )
-            self._persist_pool_result(
-                attempt_id, job, pool, snapshot_date, result
+            await asyncio.to_thread(
+                self._persist_pool_result, attempt_id, job, pool, snapshot_date, result
             )
-            self._publish_pool(
-                base, attempt_id, job, pool, snapshot_date, universe, result
+            await asyncio.to_thread(
+                self._publish_pool,
+                base, attempt_id, job, pool, snapshot_date, universe, result,
             )
         except BaseException as exc:
-            self.store.insert_attempt_state(
+            await asyncio.to_thread(
+                self.store.insert_attempt_state,
                 {
                     **base,
                     "status": "failed",
                     "error_class": type(exc).__name__,
                     "error_message": str(exc)[:4096],
                     "finished_at": datetime.now(UTC),
-                }
+                },
             )
             raise
         return attempt_id
