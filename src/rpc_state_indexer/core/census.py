@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -40,6 +40,7 @@ from rpc_state_indexer.observability.metrics import (
     CENSUS_CALL_FAILURES,
     CENSUS_CALLS,
     PUBLISH_LAG_DAYS,
+    READBACK_RETRIES,
     SUPPLY_RESIDUAL_PPM,
     SUSPECT_ZEROS,
 )
@@ -104,15 +105,15 @@ class CensusStore(Protocol):
 
     def append_publication(self, row: dict[str, Any]) -> int: ...
 
-    def terminal_error_count(self, scope: AttemptScope) -> int: ...
+    def terminal_error_count(self, scope: AttemptScope, *, consistent: bool = False) -> int: ...
 
-    def readback_universe_digest(self, scope: AttemptScope) -> str: ...
+    def readback_universe_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str: ...
 
-    def readback_token_digest(self, scope: AttemptScope) -> str: ...
+    def readback_token_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str: ...
 
-    def readback_pool_digest(self, scope: AttemptScope) -> str: ...
+    def readback_pool_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str: ...
 
-    def readback_cl_digest(self, scope: AttemptScope) -> str: ...
+    def readback_cl_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str: ...
 
 
 def executor_kind_for_anchor(catalog: Catalog, anchor: BlockRef) -> ExecutorKind:
@@ -823,6 +824,26 @@ class CensusRunner:
             attempt_id=base["attempt_id"],
         )
 
+    def _verified_readback(
+        self,
+        kind: str,
+        read: Callable[..., str],
+        expected: str,
+    ) -> str:
+        """Read back on the fast path; on mismatch re-read with consistency once.
+
+        The fast read normally sees this attempt's own inserts (same thread, client
+        and connection). If it does not — connection churn moved it to the other
+        replica — a single consistent re-read settles it before the digest check
+        can block a good publication.
+        """
+
+        digest = read()
+        if digest == expected:
+            return digest
+        READBACK_RETRIES.labels(kind).inc()
+        return read(consistent=True)
+
     def _publication_checks(
         self,
         scope: AttemptScope,
@@ -832,7 +853,12 @@ class CensusRunner:
     ) -> list[str]:
         failed: list[str] = []
         passed: list[str] = ["historical_code_verified"]
-        if self.store.terminal_error_count(scope) != 0:
+        expected_errors = len(getattr(result, "errors", ()))
+        error_count = self.store.terminal_error_count(scope)
+        if error_count != expected_errors:
+            READBACK_RETRIES.labels("terminal_errors").inc()
+            error_count = self.store.terminal_error_count(scope, consistent=True)
+        if error_count != 0:
             failed.append("terminal_errors_present")
         else:
             passed.append("zero_terminal_errors")
@@ -850,7 +876,12 @@ class CensusRunner:
         else:
             passed.append("observation_readback_digest")
         if isinstance(result, TokenCollectionResult):
-            if self.store.readback_universe_digest(scope) != universe.universe_hash:
+            universe_digest = self._verified_readback(
+                "universe",
+                lambda **kw: self.store.readback_universe_digest(scope, **kw),
+                universe.universe_hash,
+            )
+            if universe_digest != universe.universe_hash:
                 failed.append("universe_readback_digest")
             else:
                 passed.append("universe_readback_digest")
@@ -871,7 +902,11 @@ class CensusRunner:
         result: TokenCollectionResult,
     ) -> None:
         scope = self._scope(base)
-        readback = self.store.readback_token_digest(scope)
+        readback = self._verified_readback(
+            "token",
+            lambda **kw: self.store.readback_token_digest(scope, **kw),
+            result.result_digest,
+        )
         checks = self._publication_checks(scope, universe, result, readback)
         executor, reference, providers = self._publication_context(result.batches)
         scalar_values = {row.scalar_name: row.scalar_raw for row in result.scalars}
@@ -963,7 +998,9 @@ class CensusRunner:
         result: PoolCollectionResult,
     ) -> None:
         scope = self._scope(base)
-        readback = self.store.readback_pool_digest(scope)
+        readback = self._verified_readback(
+            "pool", lambda **kw: self.store.readback_pool_digest(scope, **kw), result.result_digest
+        )
         checks = self._publication_checks(scope, universe, result, readback)
         executor, reference, providers = self._publication_context(result.batches)
         finished = datetime.now(UTC)
@@ -1023,7 +1060,9 @@ class CensusRunner:
         result: PoolClCollectionResult,
     ) -> None:
         scope = self._scope(base)
-        readback = self.store.readback_cl_digest(scope)
+        readback = self._verified_readback(
+            "cl", lambda **kw: self.store.readback_cl_digest(scope, **kw), result.result_digest
+        )
         checks = self._publication_checks(scope, universe, result, readback)
         executor, reference, providers = self._publication_context(result.batches)
         finished = datetime.now(UTC)

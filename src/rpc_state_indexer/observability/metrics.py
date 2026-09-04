@@ -77,3 +77,12 @@ __all__ = [
     "SUPPLY_RESIDUAL_PPM",
     "SUSPECT_ZEROS",
 ]
+
+READBACK_RETRIES = Counter(
+    "rpc_state_indexer_readback_retries_total",
+    "Publication read-backs that mismatched on the fast (same-connection) read and "
+    "were re-read with select_sequential_consistency. Non-zero is expected at a low "
+    "rate on ClickHouse Cloud (connection churn can move a read to the other "
+    "replica); a high rate means the same-thread persist/publish invariant broke.",
+    ("kind",),
+)

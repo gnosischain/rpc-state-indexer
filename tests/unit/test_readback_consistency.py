@@ -97,3 +97,18 @@ def test_plain_queries_do_not_carry_the_setting() -> None:
     )
 
     assert all("settings" not in call for call in client.calls)
+
+
+def test_consistent_rereads_carry_the_setting() -> None:
+    client = CapturingClient()
+    repository = ClickHouseRepository(client, "db")
+
+    repository.terminal_error_count(SCOPE, consistent=True)
+    repository.readback_universe_digest(SCOPE, consistent=True)
+    repository.readback_token_digest(SCOPE, consistent=True)
+    repository.readback_pool_digest(SCOPE, consistent=True)
+    repository.readback_cl_digest(SCOPE, consistent=True)
+
+    assert len(client.calls) == 7
+    for call in client.calls:
+        assert call.get("settings") == {"select_sequential_consistency": 1}, call["sql"][:60]

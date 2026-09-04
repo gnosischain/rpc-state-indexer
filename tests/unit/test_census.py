@@ -82,10 +82,10 @@ class FakeStore:
         self.publications.append(dict(row))
         return 1
 
-    def terminal_error_count(self, scope: AttemptScope) -> int:
+    def terminal_error_count(self, scope: AttemptScope, *, consistent: bool = False) -> int:
         return sum(row["attempt_id"] == scope.attempt_id for row in self.errors)
 
-    def readback_universe_digest(self, scope: AttemptScope) -> str:
+    def readback_universe_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
         return digest_universe(
             (
                 str(row["holder_address"]),
@@ -95,7 +95,7 @@ class FakeStore:
             if row["attempt_id"] == scope.attempt_id
         )
 
-    def readback_token_digest(self, scope: AttemptScope) -> str:
+    def readback_token_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
         return digest_token_observations(
             (
                 BalanceDigestRow(
@@ -329,13 +329,13 @@ class ThreadRecordingStore(FakeStore):
         self._mark("scalars")
         return super().insert_token_scalars(rows, **kwargs)
 
-    def readback_universe_digest(self, scope: AttemptScope) -> str:
+    def readback_universe_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
         self._mark("readback_universe")
-        return super().readback_universe_digest(scope)
+        return super().readback_universe_digest(scope, consistent=consistent)
 
-    def readback_token_digest(self, scope: AttemptScope) -> str:
+    def readback_token_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
         self._mark("readback_token")
-        return super().readback_token_digest(scope)
+        return super().readback_token_digest(scope, consistent=consistent)
 
     def append_publication(self, row: Mapping[str, Any]) -> int:
         self._mark("publication")
@@ -368,3 +368,50 @@ async def test_attempt_rows_and_their_readbacks_share_one_thread() -> None:
     assert len(idents) == 1, bound
     # ...and none of it ran on the event-loop thread.
     assert threading.get_ident() not in idents
+
+
+class FlakyReadbackStore(FakeStore):
+    """First (fast) read-back returns a stale digest, like a read that landed on the
+    other replica before replication; the consistent re-read returns the truth."""
+
+    def __init__(self, *, always_stale: bool = False) -> None:
+        super().__init__()
+        self.always_stale = always_stale
+        self.consistent_reads: list[str] = []
+
+    def readback_token_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
+        if consistent:
+            self.consistent_reads.append("token")
+        if self.always_stale or not consistent:
+            return "stale"
+        return super().readback_token_digest(scope)
+
+    def readback_universe_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
+        if consistent:
+            self.consistent_reads.append("universe")
+        if self.always_stale or not consistent:
+            return "stale"
+        return super().readback_universe_digest(scope)
+
+
+@pytest.mark.asyncio
+async def test_stale_fast_readback_is_settled_by_one_consistent_reread() -> None:
+    store = FlakyReadbackStore()
+    subject, job, token = runner(store, FakeCollector())
+
+    await subject.run_token(job, token, date(2026, 7, 18), ANCHOR)
+
+    assert len(store.publications) == 1  # published, not blocked
+    assert sorted(store.consistent_reads) == ["token", "universe"]  # exactly one re-read each
+
+
+@pytest.mark.asyncio
+async def test_persistent_readback_mismatch_still_blocks() -> None:
+    store = FlakyReadbackStore(always_stale=True)
+    subject, job, token = runner(store, FakeCollector())
+
+    with pytest.raises(PublicationBlocked):
+        await subject.run_token(job, token, date(2026, 7, 18), ANCHOR)
+
+    assert store.publications == []
+    assert store.attempts[-1]["status"] == "failed"

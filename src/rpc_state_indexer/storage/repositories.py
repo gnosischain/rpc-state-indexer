@@ -534,7 +534,7 @@ class ClickHouseRepository:
         was the single largest line of a census run.
         """
 
-        rows = self._prefetch_rows(
+        rows = self._consistent_rows(
             f"""
             SELECT lower(target_address) AS target_address
             FROM {self.database}.v_publications_current
@@ -615,12 +615,15 @@ class ClickHouseRepository:
 
     # Read-after-write across replicas. ClickHouse Cloud replicates asynchronously, so a
     # SELECT on another replica can miss a just-committed insert. Per-attempt read-backs
-    # avoid this structurally (insert and read-back share one thread, client and
-    # connection, hence one replica); the consistency wait is reserved for the
-    # once-per-job publication prefetch, where its cost is negligible. Applied to every
-    # per-target read-back it stalled each one behind ALL concurrent inserts
-    # (38 ms -> 600 ms) and became the throughput ceiling.
-    _PREFETCH_SETTINGS: Mapping[str, Any] = {"select_sequential_consistency": 1}
+    # get this structurally most of the time (insert and read-back share one thread,
+    # client and connection, hence one replica), but connection churn — a server-closed
+    # keep-alive transparently retried on a fresh connection — can still move a read to
+    # the other replica (~10% of attempts measured). So read-backs run plain first and
+    # are re-read with `consistent=True` only on a digest mismatch; the wait is also
+    # used for the once-per-job publication prefetch. Applied to EVERY read-back it
+    # stalled each one behind all concurrent inserts (38 ms -> 600 ms) and capped
+    # throughput.
+    _CONSISTENT_READ_SETTINGS: Mapping[str, Any] = {"select_sequential_consistency": 1}
 
     def query_rows(
         self,
@@ -641,12 +644,22 @@ class ClickHouseRepository:
             for values in getattr(result, "result_rows", ())
         ]
 
-    def _prefetch_rows(
+    def _readback(
+        self,
+        consistent: bool,
+        sql: str,
+        parameters: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if consistent:
+            return self.query_rows(sql, parameters, settings=self._CONSISTENT_READ_SETTINGS)
+        return self.query_rows(sql, parameters)
+
+    def _consistent_rows(
         self,
         sql: str,
         parameters: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        return self.query_rows(sql, parameters, settings=self._PREFETCH_SETTINGS)
+        return self.query_rows(sql, parameters, settings=self._CONSISTENT_READ_SETTINGS)
 
     def canonical_anchor(self, chain_id: int, snapshot_date: date) -> dict[str, Any] | None:
         rows = self.query_rows(
@@ -690,7 +703,10 @@ class ClickHouseRepository:
         value = rows[0]["config_hash"]
         return value.decode("ascii") if isinstance(value, bytes) else str(value)
 
-    def terminal_error_count(self, scope: AttemptScope) -> int:
+    def terminal_error_count(self, scope: AttemptScope, *, consistent: bool = False) -> int:
+        extra: dict[str, Any] = (
+            {"settings": dict(self._CONSISTENT_READ_SETTINGS)} if consistent else {}
+        )
         result = self.client.query(
             f"""
             SELECT count()
@@ -698,11 +714,12 @@ class ClickHouseRepository:
             WHERE {AttemptScope.predicate("target_address")}
             """,
             parameters=scope.parameters(),
+                        **extra,
                     )
         return int(result.result_rows[0][0])
 
-    def readback_universe_digest(self, scope: AttemptScope) -> str:
-        rows = self.query_rows(
+    def readback_universe_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
+        rows = self._readback(consistent, 
             f"""
             SELECT holder_address, member_sources
             FROM {self.database}.census_universe_members FINAL
@@ -715,8 +732,8 @@ class ClickHouseRepository:
             (row["holder_address"], row["member_sources"]) for row in rows
         )
 
-    def readback_token_digest(self, scope: AttemptScope) -> str:
-        balances = self.query_rows(
+    def readback_token_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
+        balances = self._readback(consistent, 
             f"""
             SELECT holder_address, balance_raw, scaled_balance_raw, value_kind
             FROM {self.database}.token_balances FINAL
@@ -725,7 +742,7 @@ class ClickHouseRepository:
             """,
             scope.parameters(),
         )
-        scalars = self.query_rows(
+        scalars = self._readback(consistent, 
             f"""
             SELECT scalar_name, scalar_raw
             FROM {self.database}.token_scalars FINAL
@@ -757,8 +774,8 @@ class ClickHouseRepository:
             ),
         )
 
-    def readback_pool_digest(self, scope: AttemptScope) -> str:
-        rows = self.query_rows(
+    def readback_pool_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
+        rows = self._readback(consistent, 
             f"""
             SELECT pool_address, token_address, balance_raw
             FROM {self.database}.pool_token_balances FINAL
@@ -776,8 +793,8 @@ class ClickHouseRepository:
             for row in rows
         )
 
-    def readback_cl_digest(self, scope: AttemptScope) -> str:
-        state_rows = self.query_rows(
+    def readback_cl_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str:
+        state_rows = self._readback(consistent, 
             f"""
             SELECT pool_address, sqrt_price_x96, current_tick, liquidity,
                    fee_growth_global_0_x128, fee_growth_global_1_x128,
@@ -802,7 +819,7 @@ class ClickHouseRepository:
             fee=int(row["fee"]),
             tick_count=int(row["tick_count"]),
         )
-        tick_rows = self.query_rows(
+        tick_rows = self._readback(consistent, 
             f"""
             SELECT pool_address, tick, liquidity_gross, liquidity_net,
                    fee_growth_outside_0_x128, fee_growth_outside_1_x128
