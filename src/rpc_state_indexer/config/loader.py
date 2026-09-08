@@ -257,6 +257,12 @@ def load_catalog(config_root: Path, chain_name: str) -> Catalog:
 
 
 def validate_catalog(catalog: Catalog) -> None:
+    for token in catalog.tokens.values():
+        unknown = [alias for alias in token.universe_aliases if alias not in catalog.tokens]
+        if unknown:
+            raise ConfigError(
+                f"token {token.address} universe_aliases reference unknown tokens: {unknown}"
+            )
     for pool in catalog.pools.values():
         missing = [asset.token for asset in pool.assets if asset.token not in catalog.tokens]
         if missing:

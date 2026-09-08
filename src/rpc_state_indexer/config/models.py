@@ -116,6 +116,11 @@ class TokenConfig(BaseModel):
     supply_functions: list[str] = Field(default_factory=lambda: ["totalSupply"])
     discovery_events: list[EventConfig]
     seed_holders: list[Address] = Field(default_factory=list)
+    # Other catalog tokens whose discovered holders are unioned into THIS token's
+    # full-holders universe. For contracts that share one ledger (Monerium EURe v1
+    # 0xcb444e… reports the balances minted/moved on v2 0x420ca0…), holders that only
+    # ever transacted on the alias are invisible to this token's own event scan.
+    universe_aliases: list[Address] = Field(default_factory=list)
     index_source: IndexSourceConfig | None = None
 
     @property
@@ -124,6 +129,10 @@ class TokenConfig(BaseModel):
 
     @model_validator(mode="after")
     def valid_token_semantics(self) -> TokenConfig:
+        if self.address in self.universe_aliases:
+            raise ValueError("a token cannot alias its own address")
+        if len(set(self.universe_aliases)) != len(self.universe_aliases):
+            raise ValueError("universe_aliases must be unique")
         if self.date_end is not None and self.date_start is not None:
             if self.date_end <= self.date_start:
                 raise ValueError("date_end must be after date_start")

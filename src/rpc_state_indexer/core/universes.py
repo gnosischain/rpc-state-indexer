@@ -112,6 +112,7 @@ class UniverseResolver:
         holder_repository: HolderUniverseRepository,
         explicit_list_loader: Callable[[str], Iterable[str]],
         seed_holders: Mapping[str, Iterable[str]] | None = None,
+        universe_aliases: Mapping[str, Iterable[str]] | None = None,
     ) -> None:
         if chain_id < 1:
             raise ValueError("chain_id must be positive")
@@ -122,6 +123,10 @@ class UniverseResolver:
         self.seed_holders = {
             normalize_address(token): tuple(normalize_address(item) for item in holders)
             for token, holders in (seed_holders or {}).items()
+        }
+        self.universe_aliases = {
+            normalize_address(token): tuple(normalize_address(item) for item in aliases)
+            for token, aliases in (universe_aliases or {}).items()
         }
 
     def resolve(
@@ -172,11 +177,17 @@ class UniverseResolver:
         next_stack = (*stack, universe_name)
         if selector.kind == "full_holders":
             full_output: dict[str, set[str]] = {}
-            for member in self.holder_repository.holder_members(
-                chain_id=self.chain_id,
-                token_address=token_address,
-                anchor_block=anchor_block,
-            ):
+            ledgers = (token_address, *self.universe_aliases.get(token_address, ()))
+            members = [
+                member
+                for ledger in ledgers
+                for member in self.holder_repository.holder_members(
+                    chain_id=self.chain_id,
+                    token_address=ledger,
+                    anchor_block=anchor_block,
+                )
+            ]
+            for member in members:
                 address = normalize_address(member.address)
                 if not member.sources:
                     raise ConfigError(

@@ -619,6 +619,13 @@ class IndexerService:
             for token in catalog.token_targets(job):
                 if self._active(token, snapshot_date, anchor.number):
                     selected[token.address] = token
+        # Aliased ledgers are discovered under their own address, so a token whose
+        # balances live on another contract sees that contract's holders too.
+        for token in list(selected.values()):
+            for alias in token.universe_aliases:
+                alias_token = catalog.tokens[alias]
+                if self._active(alias_token, snapshot_date, anchor.number):
+                    selected.setdefault(alias, alias_token)
         discovery = self._discovery_service()
         failures: list[str] = []
         for token in sorted(selected.values(), key=lambda item: item.address):
@@ -663,6 +670,11 @@ class IndexerService:
                 token.address: token.seed_holders
                 for token in catalog.tokens.values()
                 if token.seed_holders
+            },
+            universe_aliases={
+                token.address: token.universe_aliases
+                for token in catalog.tokens.values()
+                if token.universe_aliases
             },
         )
         return CensusRunner(

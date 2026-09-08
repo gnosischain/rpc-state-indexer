@@ -350,3 +350,13 @@ async def test_full_erc20_supply_dust_publishes_only_with_tolerance(
     assert equality.expected == supply
     assert equality.passed is expected
     assert result.verified is expected
+
+
+def test_token_cannot_alias_itself_or_repeat_aliases() -> None:
+    base = token_config().model_dump()
+    with pytest.raises(ValueError):
+        TokenConfig(**{**base, "universe_aliases": [TOKEN]})
+    other = "0x" + "ab" * 20
+    with pytest.raises(ValueError):
+        TokenConfig(**{**base, "universe_aliases": [other, other]})
+    assert TokenConfig(**{**base, "universe_aliases": [other]}).universe_aliases == [other]

@@ -165,3 +165,55 @@ def test_clickhouse_adapter_pins_token_and_anchor() -> None:
         "token_address": TOKEN,
         "anchor_block": 456,
     }
+
+
+ALIAS = "0x" + "44" * 20
+
+
+@dataclass
+class LedgerHolders:
+    by_ledger: Mapping[str, tuple[UniverseMember, ...]]
+    calls: list[str]
+
+    def holder_members(
+        self,
+        *,
+        chain_id: int,
+        token_address: str,
+        anchor_block: int,
+    ) -> Iterable[UniverseMember]:
+        self.calls.append(token_address)
+        return self.by_ledger.get(token_address, ())
+
+
+def test_universe_aliases_union_the_aliased_ledgers_holders() -> None:
+    repository = LedgerHolders(
+        {
+            TOKEN: (UniverseMember(A, ("own_scan",)),),
+            ALIAS: (UniverseMember(B, ("own_scan",)), UniverseMember(A, ("seed",))),
+        },
+        [],
+    )
+    subject = UniverseResolver(
+        chain_id=100,
+        universes={"full": UniverseConfig(kind="full_holders")},
+        holder_repository=repository,
+        explicit_list_loader=lambda name: (),
+        universe_aliases={TOKEN: (ALIAS,)},
+    )
+
+    universe = subject.resolve("full", token_address=TOKEN, anchor_block=10)
+
+    assert repository.calls == [TOKEN, ALIAS]
+    assert universe.addresses == (A, B)
+    assert universe.sources[A] == ("full_holders:full:own_scan", "full_holders:full:seed")
+    assert universe.sources[B] == ("full_holders:full:own_scan",)
+
+    plain = UniverseResolver(
+        chain_id=100,
+        universes={"full": UniverseConfig(kind="full_holders")},
+        holder_repository=LedgerHolders(repository.by_ledger, []),
+        explicit_list_loader=lambda name: (),
+    ).resolve("full", token_address=TOKEN, anchor_block=10)
+    assert plain.addresses == (A,)
+    assert plain.universe_hash != universe.universe_hash

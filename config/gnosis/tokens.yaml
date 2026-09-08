@@ -29735,6 +29735,8 @@ tokens:
   decimals: 18
   token_class: standard_erc20
   deployment_block: 25223086
+  universe_aliases:
+  - '0x420ca0f9b9b604ce0fd9c18ef134c705e5fa3430'
   discovery_events:
   - abi: erc20
     event: Transfer
