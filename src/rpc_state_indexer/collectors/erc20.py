@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from rpc_state_indexer.config.models import TokenConfig
 from rpc_state_indexer.domain import (
     BalanceRow,
@@ -41,9 +43,31 @@ def _assert_universe(universe: FrozenUniverse) -> None:
         raise ValueError("frozen universe provenance must cover every address exactly")
 
 
+def holder_sum_within_tolerance(
+    observed: int, expected: int, relative_tolerance: float
+) -> bool:
+    """True when ``observed`` is within ``relative_tolerance`` of ``expected``.
+
+    Exact integer arithmetic: the allowance is ``expected * tolerance`` truncated to
+    wei, so a tolerance of 0 restores the strict equality invariant.
+    """
+    if relative_tolerance < 0:
+        raise ValueError("relative tolerance must be >= 0")
+    allowance = int(Decimal(expected) * Decimal(repr(relative_tolerance)))
+    return abs(observed - expected) <= allowance
+
+
 class Erc20Collector:
-    def __init__(self, executor: HistoricalCallExecutor) -> None:
+    def __init__(
+        self,
+        executor: HistoricalCallExecutor,
+        *,
+        holder_sum_relative_tolerance: float = 0.0,
+    ) -> None:
+        if holder_sum_relative_tolerance < 0:
+            raise ValueError("holder_sum_relative_tolerance must be >= 0")
         self.executor = executor
+        self.holder_sum_relative_tolerance = holder_sum_relative_tolerance
 
     async def collect(
         self,
@@ -161,7 +185,11 @@ class Erc20Collector:
                     passed=(
                         complete
                         and expected_supply is not None
-                        and observed_sum == expected_supply
+                        and holder_sum_within_tolerance(
+                            observed_sum,
+                            expected_supply,
+                            self.holder_sum_relative_tolerance,
+                        )
                     ),
                     check="holder_sum_equals_total_supply",
                     observed=observed_sum,
@@ -184,4 +212,4 @@ class Erc20Collector:
         )
 
 
-__all__ = ["Erc20Collector", "scalar_calldata"]
+__all__ = ["Erc20Collector", "holder_sum_within_tolerance", "scalar_calldata"]

@@ -669,7 +669,10 @@ class IndexerService:
             catalog=catalog,
             store=repository,
             universe_resolver=universes,
-            erc20_collector=Erc20Collector(runtime.executor),
+            erc20_collector=Erc20Collector(
+                runtime.executor,
+                holder_sum_relative_tolerance=self.settings.holder_sum_relative_tolerance,
+            ),
             atoken_collector=ATokenCollector(runtime.executor),
             pool_collector=PoolReserveCollector(runtime.executor),
             balancer_collector=BalancerPoolCollector(

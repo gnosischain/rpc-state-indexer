@@ -65,6 +65,13 @@ class RuntimeSettings(BaseSettings):
     census_target_concurrency: int = Field(
         default=16, alias="CENSUS_TARGET_CONCURRENCY", ge=1, le=256
     )
+    # Full-supply publication invariant: the holder-balance sum may fall short of
+    # totalSupply by this relative amount and still publish. Measured 2026-09-06 on
+    # Gnosis: WXDAI short 4.4e-10, aWETH 2e-19, bNVDA 7e-22 (rounding dust) versus
+    # EURe short 6.7e-2 (a real discovery gap) — 1e-9 separates the two classes.
+    holder_sum_relative_tolerance: float = Field(
+        default=1e-9, alias="HOLDER_SUM_RELATIVE_TOLERANCE", ge=0.0, le=1e-3
+    )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @field_validator("clickhouse_database")

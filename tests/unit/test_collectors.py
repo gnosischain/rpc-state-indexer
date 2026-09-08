@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import pytest
 
 from rpc_state_indexer.collectors.atoken import RAY, ATokenCollector, ray_mul_half_up
-from rpc_state_indexer.collectors.erc20 import Erc20Collector
+from rpc_state_indexer.collectors.erc20 import Erc20Collector, holder_sum_within_tolerance
 from rpc_state_indexer.collectors.pools import PoolReserveCollector
 from rpc_state_indexer.config.models import (
     EventConfig,
@@ -292,3 +292,61 @@ async def test_pool_balances_keep_zero_and_isolate_an_asset_failure() -> None:
     assert result.balances[0].balance_raw == 0
     assert result.errors[0].subject_address == token_two
     assert result.verified is False
+
+
+@pytest.mark.parametrize(
+    ("observed", "expected", "tolerance", "passes"),
+    [
+        # WXDAI 2026-09-06: short 2.35e16 wei of 5.39e25 (4.4e-10 relative).
+        (53889106233000997385416618, 53889106256462702263262042, 1e-9, True),
+        # EURe 2026-09-06: short 6.7% — a real discovery gap, never tolerated.
+        (17576347807180774261107760, 18836026128495221784118887, 1e-9, False),
+        (3, 4, 0.0, False),
+        (4, 4, 0.0, True),
+        (10**24 - 1, 10**24, 1e-9, True),
+        (10**24 + 10**15, 10**24, 1e-9, True),
+        (10**24 + 10**15 + 1, 10**24, 1e-9, False),
+    ],
+)
+def test_holder_sum_within_tolerance(
+    observed: int, expected: int, tolerance: float, passes: bool
+) -> None:
+    assert holder_sum_within_tolerance(observed, expected, tolerance) is passes
+
+
+def test_holder_sum_tolerance_rejects_negative() -> None:
+    with pytest.raises(ValueError):
+        holder_sum_within_tolerance(1, 1, -1e-9)
+    with pytest.raises(ValueError):
+        Erc20Collector(FakeExecutor({}), holder_sum_relative_tolerance=-1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tolerance", "expected"), [(0.0, False), (1e-9, True)])
+async def test_full_erc20_supply_dust_publishes_only_with_tolerance(
+    tolerance: float, expected: bool
+) -> None:
+    supply = 10**24
+    executor = FakeExecutor(
+        {
+            f"balanceOf/{A}": supply // 2,
+            f"balanceOf/{B}": supply // 2 - 1,
+            "scalar/totalSupply": supply,
+        }
+    )
+
+    result = await Erc20Collector(
+        executor, holder_sum_relative_tolerance=tolerance
+    ).collect(
+        token=token_config(),
+        universe=universe(A, B),
+        anchor=ANCHOR,
+        integrity_mode=IntegrityMode.FULL_SUPPLY,
+    )
+
+    equality = result.integrity_checks[1]
+    assert equality.check == "holder_sum_equals_total_supply"
+    assert equality.observed == supply - 1
+    assert equality.expected == supply
+    assert equality.passed is expected
+    assert result.verified is expected
