@@ -169,6 +169,15 @@ async def benchmark_single_batch_ceiling(
     )
 
 
+def archive_probe_block(default_block: int, floor_block: int | None) -> int:
+    """Reference block for the archive-capability probe: the earliest token's deployment
+    block, raised to ``floor_block`` when configured (the probed token has code at any
+    later block, and the endpoint is then gated to serve state at or above it)."""
+    if floor_block is None:
+        return default_block
+    return max(default_block, floor_block)
+
+
 def _emit(event: str, **fields: object) -> None:
     """Emit structured progress without endpoint URLs or credentials."""
 
@@ -427,7 +436,10 @@ class IndexerService:
                     multicall_deployment_block=multicall.deployment_block,
                     expected_multicall_code_hash=expected_hash,
                     archive_probe_address=archive_token.address,
-                    archive_probe_block=archive_token.deployment_block,
+                    archive_probe_block=archive_probe_block(
+                        archive_token.deployment_block,
+                        self.settings.archive_probe_floor_block,
+                    ),
                     archive_probe_calldata="0x" + TOTAL_SUPPLY_SELECTOR.hex(),
                 )
             except Exception as exc:

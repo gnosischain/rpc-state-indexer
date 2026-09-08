@@ -32,7 +32,7 @@ def test_gating_and_read_back_tables_stay_synchronous() -> None:
     repository.insert_token_balances(
         [{"chain_id": 100, "attempt_id": attempt, "holder_address": "0xabc", "balance_raw": 1}],
         attempt_id=attempt,
-        batch_sequence=0,
+        chunk_index=0,
     )
     repository.append_publication(
         {"chain_id": 100, "attempt_id": attempt, "publication_id": uuid4()}

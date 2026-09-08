@@ -75,7 +75,9 @@ def build_rpc_runtime(settings: RuntimeSettings, catalog: Catalog) -> RpcRuntime
         batch_size=settings.multicall_batch_size,
         # Independent batches go out together; the client's own semaphore and rate limiter
         # remain the real ceiling, so this just stops them from sitting idle.
-        max_parallel_batches=settings.rpc_concurrency,
+        max_parallel_batches=(
+            settings.multicall_max_parallel_batches or settings.rpc_concurrency
+        ),
     )
     legacy = LegacyRpcBatchExecutor(
         rpc,

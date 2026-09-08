@@ -42,12 +42,23 @@ from rpc_state_indexer.observability.metrics import (
 )
 from rpc_state_indexer.rpc.classification import (
     FailureKind,
+    RpcFailure,
     classify_rpc_failure,
     normalize_rpc_error,
 )
 from rpc_state_indexer.rpc.client import AsyncRpcClient
 from rpc_state_indexer.rpc.endpoint import RpcEndpoint
 from rpc_state_indexer.rpc.errors import RpcNoHealthyEndpoint, RpcProviderLimit
+
+
+def _first_leaf(group: BaseExceptionGroup[BaseException]) -> BaseException:
+    """The first non-group exception inside a TaskGroup failure."""
+
+    for exc in group.exceptions:
+        if isinstance(exc, BaseExceptionGroup):
+            return _first_leaf(exc)
+        return exc
+    return group
 
 
 class Multicall3Executor:
@@ -90,16 +101,29 @@ class Multicall3Executor:
         # left the RPC client's concurrency semaphore idle and made a full-holder census
         # (tens of batches) take tens of seconds of pure round-trip latency.
         #
-        # gather preserves input order, which batch_sequence depends on. The wave bound
-        # keeps the number of pending coroutines sane for very large universes; actual
-        # in-flight requests are already capped by the client's own semaphore.
+        # The semaphore bounds in-flight batches without wave barriers (a slow batch no
+        # longer holds back the next wave). Results are stored by input index and then
+        # flattened, so batch_sequence stays stable. The first failure cancels the
+        # remaining batches and propagates as the original exception type.
+        limiter = asyncio.Semaphore(self.max_parallel_batches)
+        slots: list[list[VerifiedBatchResult] | None] = [None] * len(groups)
+
+        async def run(index: int, group: list[ContractCall]) -> None:
+            async with limiter:
+                slots[index] = await self._execute_adaptive(group, anchor)
+
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                for index, group in enumerate(groups):
+                    tasks.create_task(run(index, group))
+        except BaseExceptionGroup as group_exc:
+            raise _first_leaf(group_exc) from group_exc
+
         output: list[VerifiedBatchResult] = []
-        for start in range(0, len(groups), self.max_parallel_batches):
-            wave = groups[start : start + self.max_parallel_batches]
-            for batch_results in await asyncio.gather(
-                *(self._execute_adaptive(group, anchor) for group in wave)
-            ):
-                output.extend(batch_results)
+        for index, batch_results in enumerate(slots):
+            if batch_results is None:
+                raise BatchResultCountMismatch(f"batch {index} produced no result")
+            output.extend(batch_results)
         return output
 
     async def _execute_adaptive(
@@ -153,22 +177,33 @@ class Multicall3Executor:
     ) -> tuple[str, RpcEndpoint, str]:
         excluded = set(exclude or ())
         last: BaseException | None = None
+        last_failure: RpcFailure | None = None
+        last_endpoint: RpcEndpoint | None = None
         for attempt in range(self.rpc.max_retries):
             try:
-                try:
-                    endpoint = await self.rpc.endpoint_pool.select(
-                        historical_block=anchor.number,
-                        require_eip1898=True,
-                        exclude=frozenset(excluded),
-                    )
-                except RpcNoHealthyEndpoint:
-                    endpoint = await self.rpc.endpoint_pool.select(
-                        historical_block=anchor.number,
-                        exclude=frozenset(excluded),
-                    )
+                endpoint = await self._select(anchor, excluded)
+            except asyncio.CancelledError:
+                raise
+            except RpcNoHealthyEndpoint as exc:
+                # Nothing is selectable: this call's failover exclusions, sibling batches'
+                # cooldowns, or archive coverage. After a transient/rate-limit failure the
+                # last endpoint is busy, not broken, so retry it (bounded by max_retries)
+                # instead of failing the batch. Permanent and archive-unavailable failures
+                # fail closed, as does a first attempt with nothing to fall back to. The
+                # caller's sentinel exclusions stay in `excluded` and are never reselected.
+                if last_endpoint is None or last_failure is None or not last_failure.retryable:
+                    last = exc
+                    break
+                endpoint = last_endpoint
             except BaseException as exc:
                 last = exc
                 break
+            if last_failure is not None:
+                await asyncio.sleep(
+                    self._retry_delay(
+                        attempt, last_failure, same_endpoint=endpoint is last_endpoint
+                    )
+                )
             reference_kind = (
                 "eip1898" if endpoint.supports_eip1898 else "number_hash_sandwich"
             )
@@ -189,10 +224,16 @@ class Multicall3Executor:
                     await assert_anchor_hash(self.rpc, endpoint, anchor)
                 if not isinstance(result, str):
                     raise ValueError("eth_call result must be hex data")
+            except asyncio.CancelledError:
+                # A sibling batch failed and the TaskGroup cancelled this one: not an
+                # endpoint failure, so it must not escalate the endpoint's cooldown.
+                raise
             except BaseException as exc:
                 normalized = normalize_rpc_error(exc)
                 failure = classify_rpc_failure(normalized)
                 last = normalized
+                last_failure = failure
+                last_endpoint = endpoint
                 self.rpc.endpoint_pool.record_failure(
                     endpoint,
                     failover=failure.failover,
@@ -205,13 +246,34 @@ class Multicall3Executor:
                     excluded.add(endpoint.name)
                 if not failure.retryable and not failure.failover:
                     raise normalized from exc
-                await asyncio.sleep(
-                    min(2.0, self.rpc.retry_base_seconds * (2**attempt))
-                )
                 continue
             self.rpc.endpoint_pool.record_success(endpoint)
             return result, endpoint, reference_kind
         raise RpcNoHealthyEndpoint("Multicall3 exhausted endpoints") from last
+
+    async def _select(self, anchor: BlockRef, excluded: set[str]) -> RpcEndpoint:
+        try:
+            return await self.rpc.endpoint_pool.select(
+                historical_block=anchor.number,
+                require_eip1898=True,
+                exclude=frozenset(excluded),
+            )
+        except RpcNoHealthyEndpoint:
+            return await self.rpc.endpoint_pool.select(
+                historical_block=anchor.number,
+                exclude=frozenset(excluded),
+            )
+
+    def _retry_delay(
+        self, attempt: int, failure: RpcFailure, *, same_endpoint: bool
+    ) -> float:
+        # `attempt` is the retry about to run; the failed one was `attempt - 1`.
+        # Retry-After is a per-endpoint hint and only applies when that endpoint is
+        # reused; a hop to another endpoint keeps the short pre-existing backoff.
+        backoff = self.rpc.retry_base_seconds * (2.0 ** (attempt - 1))
+        if not same_endpoint:
+            return min(2.0, backoff)
+        return min(60.0, max(failure.retry_after or 0.0, backoff))
 
     async def _execute_once(
         self,

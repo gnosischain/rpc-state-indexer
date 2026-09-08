@@ -420,6 +420,8 @@ and provider groups separately.
 | `RPC_CONCURRENCY` | `8` | Global in-flight RPC semaphore |
 | `RPC_REQUESTS_PER_SECOND` | `30` | Per-endpoint request limit |
 | `MULTICALL_BATCH_SIZE` | `250` | Initial post-deployment body call chunk |
+| `MULTICALL_MAX_PARALLEL_BATCHES` | `RPC_CONCURRENCY` | Multicall batches of one execute call in flight at once |
+| `ARCHIVE_PROBE_FLOOR_BLOCK` | unset | Raise the archive-capability probe block; the endpoint then serves state at or above it only |
 | `LEGACY_RPC_BATCH_SIZE` | `100` | Initial pre-deployment call chunk |
 | `MAX_RETRIES` | `5` | Transport/executor retry budget |
 | `WRITER_STALE_SECONDS` | `120` | Fresh-heartbeat overlap window |

@@ -459,12 +459,12 @@ class ClickHouseRepository:
         rows: Iterable[Mapping[str, Any]],
         *,
         attempt_id: UUID,
-        batch_sequence: int,
+        chunk_index: int,
     ) -> int:
         return self.insert_rows(
             "token_balances",
             rows,
-            deduplication_token=f"{attempt_id}:balances:{batch_sequence}",
+            deduplication_token=f"{attempt_id}:balances:{chunk_index}",
         )
 
     def insert_token_scalars(
@@ -485,12 +485,12 @@ class ClickHouseRepository:
         rows: Iterable[Mapping[str, Any]],
         *,
         attempt_id: UUID,
-        batch_sequence: int,
+        chunk_index: int,
     ) -> int:
         return self.insert_rows(
             "pool_token_balances",
             rows,
-            deduplication_token=f"{attempt_id}:pools:{batch_sequence}",
+            deduplication_token=f"{attempt_id}:pools:{chunk_index}",
         )
 
     def insert_pool_cl_state(
@@ -507,12 +507,12 @@ class ClickHouseRepository:
         rows: Iterable[Mapping[str, Any]],
         *,
         attempt_id: UUID,
-        batch_sequence: int,
+        chunk_index: int,
     ) -> int:
         return self.insert_rows(
             "pool_tick_liquidity",
             rows,
-            deduplication_token=f"{attempt_id}:cl_ticks:{batch_sequence}",
+            deduplication_token=f"{attempt_id}:cl_ticks:{chunk_index}",
         )
 
     def insert_terminal_errors(self, rows: Iterable[Mapping[str, Any]]) -> int:

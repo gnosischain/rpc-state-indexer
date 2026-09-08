@@ -70,7 +70,7 @@ class CensusStore(Protocol):
         rows: list[dict[str, Any]],
         *,
         attempt_id: UUID,
-        batch_sequence: int,
+        chunk_index: int,
     ) -> int: ...
 
     def insert_token_scalars(
@@ -86,7 +86,7 @@ class CensusStore(Protocol):
         rows: list[dict[str, Any]],
         *,
         attempt_id: UUID,
-        batch_sequence: int,
+        chunk_index: int,
     ) -> int: ...
 
     def insert_pool_cl_state(
@@ -98,7 +98,7 @@ class CensusStore(Protocol):
         rows: list[dict[str, Any]],
         *,
         attempt_id: UUID,
-        batch_sequence: int,
+        chunk_index: int,
     ) -> int: ...
 
     def insert_terminal_errors(self, rows: list[dict[str, Any]]) -> int: ...
@@ -114,6 +114,12 @@ class CensusStore(Protocol):
     def readback_pool_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str: ...
 
     def readback_cl_digest(self, scope: AttemptScope, *, consistent: bool = False) -> str: ...
+
+
+# Observation rows per synchronous INSERT. Balances, pool balances and CL ticks
+# are flattened per target and inserted in chunks of this size: one round-trip
+# per chunk instead of one per multicall batch (3,458 batches on the largest token).
+INSERT_CHUNK_ROWS = 200_000
 
 
 def executor_kind_for_anchor(catalog: Catalog, anchor: BlockRef) -> ExecutorKind:
@@ -274,8 +280,10 @@ class CensusRunner:
             raise ValueError("token census requires a universe selector")
         self._check_date_window(token, snapshot_date)
         # Every blocking ClickHouse call on this path runs in a worker thread so that
-        # concurrent targets overlap their ~13 sequential round-trips instead of
-        # serialising them on the event loop. The helpers themselves stay synchronous.
+        # concurrent targets overlap their sequential round-trips (attempt state,
+        # universe, one insert per INSERT_CHUNK_ROWS observation rows, read-backs,
+        # publication) instead of serialising them on the event loop. The helpers
+        # themselves stay synchronous.
         universe = await asyncio.to_thread(
             self.universe_resolver.resolve,
             job.universe,
@@ -617,6 +625,27 @@ class CensusRunner:
             for error in errors
         ]
 
+    @staticmethod
+    def _insert_chunked(
+        insert: Callable[..., int],
+        rows: list[dict[str, Any]],
+        *,
+        attempt_id: UUID,
+    ) -> None:
+        """Insert ``rows`` in order, at most ``INSERT_CHUNK_ROWS`` per store call.
+
+        Runs on the caller's thread: chunks go sequentially through the one
+        thread-local client, so the attempt's read-backs see every chunk.
+        ``chunk_index`` is the store's deduplication-token suffix: unique per
+        (attempt, chunk) and stable across a retry of the same attempt.
+        """
+        for chunk_index, start in enumerate(range(0, len(rows), INSERT_CHUNK_ROWS)):
+            insert(
+                rows[start : start + INSERT_CHUNK_ROWS],
+                attempt_id=attempt_id,
+                chunk_index=chunk_index,
+            )
+
     def _persist_token_result(
         self,
         attempt_id: UUID,
@@ -626,12 +655,12 @@ class CensusRunner:
         result: TokenCollectionResult,
     ) -> None:
         now = datetime.now(UTC)
-        balances_by_batch: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        balances: list[dict[str, Any]] = []
         for balance_row in result.balances:
             source = result.batches[
                 balance_row.batch_sequence
             ].evidence.executor_kind.value
-            balances_by_batch[balance_row.batch_sequence].append(
+            balances.append(
                 {
                     "chain_id": self.catalog.chain.chain_id,
                     "job_name": job.name,
@@ -647,10 +676,9 @@ class CensusRunner:
                     "observed_at": now,
                 }
             )
-        for sequence, rows in balances_by_batch.items():
-            self.store.insert_token_balances(
-                rows, attempt_id=attempt_id, batch_sequence=sequence
-            )
+        self._insert_chunked(
+            self.store.insert_token_balances, balances, attempt_id=attempt_id
+        )
 
         scalars_by_batch: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for scalar_row in result.scalars:
@@ -695,10 +723,10 @@ class CensusRunner:
         result: PoolCollectionResult,
     ) -> None:
         now = datetime.now(UTC)
-        by_batch: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        balances: list[dict[str, Any]] = []
         for row in result.balances:
             source = result.batches[row.batch_sequence].evidence.executor_kind.value
-            by_batch[row.batch_sequence].append(
+            balances.append(
                 {
                     "chain_id": self.catalog.chain.chain_id,
                     "job_name": job.name,
@@ -712,10 +740,9 @@ class CensusRunner:
                     "observed_at": now,
                 }
             )
-        for sequence, rows in by_batch.items():
-            self.store.insert_pool_balances(
-                rows, attempt_id=attempt_id, batch_sequence=sequence
-            )
+        self._insert_chunked(
+            self.store.insert_pool_balances, balances, attempt_id=attempt_id
+        )
         errors = self._error_rows(
             attempt_id,
             job,
@@ -763,10 +790,10 @@ class CensusRunner:
             attempt_id=attempt_id,
         )
 
-        by_batch: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        ticks: list[dict[str, Any]] = []
         for tick in result.ticks:
             source = result.batches[tick.batch_sequence].evidence.executor_kind.value
-            by_batch[tick.batch_sequence].append(
+            ticks.append(
                 {
                     "chain_id": self.catalog.chain.chain_id,
                     "job_name": job.name,
@@ -783,10 +810,9 @@ class CensusRunner:
                     "observed_at": now,
                 }
             )
-        for sequence, rows in by_batch.items():
-            self.store.insert_pool_ticks(
-                rows, attempt_id=attempt_id, batch_sequence=sequence
-            )
+        self._insert_chunked(
+            self.store.insert_pool_ticks, ticks, attempt_id=attempt_id
+        )
 
         errors = self._error_rows(
             attempt_id, job, "pool", pool.address, snapshot_date, result.errors

@@ -42,6 +42,19 @@ class RuntimeSettings(BaseSettings):
     rpc_concurrency: int = Field(default=8, alias="RPC_CONCURRENCY", ge=1)
     rpc_requests_per_second: int = Field(default=30, alias="RPC_REQUESTS_PER_SECOND", ge=1)
     multicall_batch_size: int = Field(default=250, alias="MULTICALL_BATCH_SIZE", ge=1)
+    # Multicall batches of one execute() call in flight at once; unset = RPC_CONCURRENCY.
+    # Archive-capability probe: the earliest catalog token's deployment block is the
+    # default reference. A node whose historical eth_call fails before some fork block
+    # (Gnosis `devops`: -32603 at 11.17M, fine at 18.1M+) would be excluded for the
+    # process lifetime although every daily anchor since 2025 is above 42M. Setting a
+    # floor probes at max(default, floor); the endpoint then serves state calls at or
+    # above that block only (archive_from_block gating), so nothing pre-floor is routed to it.
+    archive_probe_floor_block: int | None = Field(
+        default=None, alias="ARCHIVE_PROBE_FLOOR_BLOCK", ge=1
+    )
+    multicall_max_parallel_batches: int | None = Field(
+        default=None, alias="MULTICALL_MAX_PARALLEL_BATCHES", ge=1
+    )
     legacy_rpc_batch_size: int = Field(default=100, alias="LEGACY_RPC_BATCH_SIZE", ge=1)
     max_retries: int = Field(default=5, alias="MAX_RETRIES", ge=1)
     writer_stale_seconds: int = Field(default=120, alias="WRITER_STALE_SECONDS", ge=30)
@@ -59,9 +72,10 @@ class RuntimeSettings(BaseSettings):
     # Comma-separated job names the daemon runs each cycle; empty = every daily job. Use this to
     # scope a single daemon away from the full multi-thousand-target catalog.
     daemon_jobs: str = Field(default="", alias="DAEMON_JOBS")
-    # Targets censused concurrently within one job. Each target is ~13 sequential
-    # network round-trips (mostly ClickHouse bookkeeping at 30-185 ms each), so serial
-    # processing was latency-bound at <1 target/s regardless of RPC concurrency.
+    # Targets censused concurrently within one job. Each target is a handful of
+    # sequential network round-trips (ClickHouse bookkeeping at 30-185 ms each, plus
+    # one observation insert per 200k rows), so serial processing was latency-bound
+    # at <1 target/s regardless of RPC concurrency.
     census_target_concurrency: int = Field(
         default=16, alias="CENSUS_TARGET_CONCURRENCY", ge=1, le=256
     )

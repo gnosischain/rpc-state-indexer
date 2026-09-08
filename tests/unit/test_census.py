@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import pytest
 
@@ -21,6 +22,7 @@ from rpc_state_indexer.domain import (
     BlockRef,
     ExecutorKind,
     FrozenUniverse,
+    IntegrityMode,
     IntegrityResult,
     ObservationStatus,
     ScalarRow,
@@ -34,7 +36,7 @@ from rpc_state_indexer.storage.digests import (
     digest_token_observations,
     digest_universe,
 )
-from rpc_state_indexer.storage.repositories import AttemptScope
+from rpc_state_indexer.storage.repositories import AttemptScope, ClickHouseRepository
 
 ROOT = Path(__file__).parents[2]
 HOLDER = "0x" + "11" * 20
@@ -415,3 +417,103 @@ async def test_persistent_readback_mismatch_still_blocks() -> None:
 
     assert store.publications == []
     assert store.attempts[-1]["status"] == "failed"
+
+
+class CapturingClient:
+    def __init__(self) -> None:
+        self.inserts: list[dict[str, Any]] = []
+
+    def insert(self, table: str, data: Any, *, column_names: Any, settings: dict[str, Any]) -> None:
+        self.inserts.append({"table": table, "rows": len(data), "settings": settings})
+
+
+class ChunkRecordingStore(FakeStore):
+    """Routes balance inserts through the real repository so the dedup token is
+    the one production would send, and records each store call's rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.client = CapturingClient()
+        self.repository = ClickHouseRepository(cast(Any, self.client), "db")
+        self.balance_calls: list[list[dict[str, Any]]] = []
+
+    def insert_token_balances(self, rows: list[dict[str, Any]], **kwargs: Any) -> int:
+        self.balance_calls.append(list(rows))
+        self.repository.insert_token_balances(rows, **kwargs)
+        return super().insert_token_balances(rows, **kwargs)
+
+
+def _large_token_result(
+    token_address: str, universe_hash: str, holders: int
+) -> TokenCollectionResult:
+    evidence = VerificationEvidence(
+        ExecutorKind.MULTICALL3, "eip1898", ANCHOR.block_hash, ("provider-a",), "c" * 64, True
+    )
+    per_batch = 1_000
+    batch_count = -(-holders // per_batch)
+    balances = tuple(
+        BalanceRow(f"0x{index:040x}", index, batch_sequence=index // per_batch)
+        for index in range(holders)
+    )
+    batches = tuple(
+        CollectionBatchEvidence(sequence, per_batch, evidence) for sequence in range(batch_count)
+    )
+    return TokenCollectionResult(
+        token_address,
+        universe_hash,
+        IntegrityMode.SCOPED,
+        holders + 1,
+        balances,
+        (ScalarRow("totalSupply", 0),),
+        (),
+        batches,
+        (IntegrityResult.complete("observations_complete"),),
+    )
+
+
+def test_balances_are_inserted_in_chunks_with_distinct_dedup_tokens() -> None:
+    # 450k rows -> 200k + 200k + 50k: three store calls, not one per multicall batch.
+    store = ChunkRecordingStore()
+    subject, job, token = runner(store, FakeCollector())
+    result = _large_token_result(token.address, "u" * 64, 450_000)
+    attempt = uuid4()
+
+    subject._persist_token_result(attempt, job, token, date(2026, 7, 18), result)
+
+    assert [len(rows) for rows in store.balance_calls] == [200_000, 200_000, 50_000]
+    balance_inserts = [i for i in store.client.inserts if i["table"] == "db.token_balances"]
+    tokens = [i["settings"]["insert_deduplication_token"] for i in balance_inserts]
+    assert tokens == [f"{attempt}:balances:{index}" for index in range(3)]
+    assert len(set(tokens)) == 3
+    for insert in balance_inserts:
+        assert insert["settings"]["async_insert"] == 0
+    # The union of the chunks is the input, in order, with batch_sequence preserved.
+    persisted = [
+        (row["holder_address"], row["batch_sequence"], row["probe_source"])
+        for rows in store.balance_calls
+        for row in rows
+    ]
+    assert persisted == [
+        (row.holder_address, row.batch_sequence, "multicall3") for row in result.balances
+    ]
+    assert persisted[-1][1] == 449
+
+
+class FailingChunkStore(FakeStore):
+    def insert_token_balances(self, rows: list[dict[str, Any]], **kwargs: Any) -> int:
+        raise RuntimeError("chunk insert failed")
+
+
+@pytest.mark.asyncio
+async def test_failed_chunk_insert_marks_attempt_failed_and_publishes_nothing() -> None:
+    store = FailingChunkStore()
+    subject, job, token = runner(store, FakeCollector())
+
+    with pytest.raises(RuntimeError, match="chunk insert failed"):
+        await subject.run_token(job, token, date(2026, 7, 18), ANCHOR)
+
+    assert store.publications == []
+    assert store.balances == []
+    failed = store.attempts[-1]
+    assert failed["status"] == "failed"
+    assert failed["error_class"] == "RuntimeError"
