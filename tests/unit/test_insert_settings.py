@@ -20,10 +20,16 @@ def _repo() -> tuple[ClickHouseRepository, CapturingClient]:
     return ClickHouseRepository(client, "db"), client
 
 
-def test_attempt_state_is_async_and_does_not_wait() -> None:
+def test_attempt_state_is_synchronous_so_state_rows_version_in_order() -> None:
+    # started/verified rows of one attempt collapse under ReplacingMergeTree by
+    # insert_version; async buffering let a late-flushed "started" row outrank the
+    # "verified" one (10-20% of pool attempts, 2026-09-11). Each insert must get its
+    # own, later version.
     repository, client = _repo()
     repository.insert_attempt_state({"chain_id": 100, "attempt_id": uuid4(), "status": "started"})
-    assert client.inserts[0]["settings"] == {"async_insert": 1, "wait_for_async_insert": 0}
+    repository.insert_attempt_state({"chain_id": 100, "attempt_id": uuid4(), "status": "verified"})
+    for insert in client.inserts:
+        assert insert["settings"] == {"async_insert": 0}
 
 
 def test_gating_and_read_back_tables_stay_synchronous() -> None:

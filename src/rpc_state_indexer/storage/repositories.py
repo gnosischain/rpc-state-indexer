@@ -628,23 +628,19 @@ class ClickHouseRepository:
     # throughput.
     _CONSISTENT_READ_SETTINGS: Mapping[str, Any] = {"select_sequential_consistency": 1}
 
-    # Tables whose rows are never read back before a publication and never gate one:
-    # they can be inserted asynchronously, letting the server coalesce many small
-    # inserts and returning to the caller without waiting for the flush. Per target
-    # that removes two of six serial ClickHouse round-trips (attempt "started" and
-    # "verified"/"failed"). Everything read back (universe, observations, errors),
-    # the publication row (read by the next run's prefetch) and the writer heartbeat
-    # (the lock) stay synchronous.
-    #
-    # Ordering under async batching: census_attempts is ReplacingMergeTree keyed on
-    # insert_version = now64(9) at flush time, so a "started" and a "verified" row of
-    # one attempt that share a flush tie on version, and ReplacingMergeTree then keeps
-    # the last-inserted row of the part. Both rows come from one thread and one
-    # connection in order, so "verified" always wins; rows in different flushes carry
-    # strictly increasing versions. wait_for_async_insert=0 means a server-side crash
-    # could drop a buffered attempt-state row — acceptable for bookkeeping that gates
-    # nothing, and the reason this set must never grow to a gating table.
-    _ASYNC_INSERT_TABLES: frozenset[str] = frozenset({"census_attempts"})
+    # No table is inserted asynchronously. census_attempts used to be (it is never read
+    # back before a publication), but it IS a gating table: the warehouse selection and
+    # v_publications_eligible both require the attempt's "verified" row. It is
+    # ReplacingMergeTree on insert_version = now64(9), materialized at flush time, and
+    # the "started" and "verified" inserts carry different column sets, so the server
+    # buffered them in different async queues with independent flush timers. Whenever
+    # the "started" buffer flushed after the "verified" one, the started row got the
+    # higher version and survived the merge: the attempt looked unverified forever with
+    # its data and publication in place. Measured on the pool_reserves backfill of
+    # 2026-09-11 (2,650 small attempts per day): 10-20% of targets per day lost their
+    # verified row. Synchronous inserts give every row its own strictly later version;
+    # the price is two short round-trips per target.
+    _ASYNC_INSERT_TABLES: frozenset[str] = frozenset()
     _ASYNC_INSERT_SETTINGS: Mapping[str, Any] = {"async_insert": 1, "wait_for_async_insert": 0}
 
     def query_rows(
