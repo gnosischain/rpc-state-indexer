@@ -88,9 +88,9 @@ class _SqlCapturingClient(FakeClient):
         super().__init__(rows=[])
         self.sql: list[str] = []
 
-    def query(self, sql: str, **kwargs: Any) -> Any:
-        self.sql.append(sql)
-        return super().query(sql, **kwargs)
+    def query(self, _sql: str, **_kwargs: Any) -> Any:
+        self.sql.append(_sql)
+        return super().query(_sql, **_kwargs)
 
 
 def test_published_target_addresses_ignores_the_config_hash_by_default() -> None:
