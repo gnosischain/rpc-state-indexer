@@ -458,3 +458,5 @@ For each new token or pool:
 
 Do not make an unusual token pass by weakening strict decoding or converting an error
 to zero. Model its behavior explicitly or leave it disabled.
+
+| `SKIP_PUBLISHED_ANY_CONFIG_HASH` | `true` | Backfill skips a (target, day) that has a verified publication on the canonical anchor regardless of config hash (the warehouse rule). `false` restores the registry-gated view: after a config change every earlier day of a range is re-censused. |

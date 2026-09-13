@@ -528,6 +528,7 @@ class ClickHouseRepository:
         job_name: str,
         target_kind: str,
         snapshot_date: date,
+        any_config_hash: bool = True,
     ) -> frozenset[str]:
         """Every target already published for one (job, kind, date), lowercased.
 
@@ -535,17 +536,48 @@ class ClickHouseRepository:
         point lookup is routed through three view layers (a GROUP BY with ten argMax
         and a registry JOIN) and measured at ~185 ms — asked ~3,400 times per date it
         was the single largest line of a census run.
+
+        ``any_config_hash`` (default) counts a publication whose attempt is verified on
+        the canonical anchor whatever config hash it carries — the same rule the
+        warehouse applies — so a config change does not silently turn every earlier
+        day of a range into a full re-census. ``False`` keeps the registry-gated
+        ``v_publications_current`` view.
         """
 
-        rows = self._consistent_rows(
-            f"""
+        if any_config_hash:
+            sql = f"""
+            SELECT lower(p.target_address) AS target_address
+            FROM {self.database}.census_publications AS p
+            INNER JOIN {self.database}.v_day_anchors_canonical AS a
+                ON p.chain_id = a.chain_id
+               AND p.snapshot_date = a.snapshot_date
+               AND p.anchor_block = a.block_number
+               AND p.anchor_hash = a.block_hash
+            INNER JOIN {self.database}.v_census_attempts_current AS t
+                ON p.chain_id = t.chain_id
+               AND p.job_name = t.job_name
+               AND p.target_kind = t.target_kind
+               AND p.target_address = t.target_address
+               AND p.snapshot_date = t.snapshot_date
+               AND p.attempt_id = t.attempt_id
+               AND t.status = 'verified'
+            WHERE p.chain_id = {{chain_id:UInt64}}
+              AND p.job_name = {{job_name:String}}
+              AND p.target_kind = {{target_kind:String}}
+              AND p.snapshot_date = {{snapshot_date:Date}}
+            GROUP BY target_address
+            """
+        else:
+            sql = f"""
             SELECT lower(target_address) AS target_address
             FROM {self.database}.v_publications_current
             WHERE chain_id = {{chain_id:UInt64}}
               AND job_name = {{job_name:String}}
               AND target_kind = {{target_kind:String}}
               AND snapshot_date = {{snapshot_date:Date}}
-            """,
+            """
+        rows = self._consistent_rows(
+            sql,
             {
                 "chain_id": chain_id,
                 "job_name": job_name,

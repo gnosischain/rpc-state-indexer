@@ -985,6 +985,7 @@ class IndexerService:
                 job_name=job.name,
                 target_kind=target_kind,
                 snapshot_date=snapshot_date,
+                any_config_hash=self.settings.skip_published_any_config_hash,
             )
             work: list[tuple[TokenConfig | PoolConfig, str]] = []
             if job.target_kind == "tokens":

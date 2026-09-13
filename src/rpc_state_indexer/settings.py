@@ -87,6 +87,14 @@ class RuntimeSettings(BaseSettings):
         default=1e-9, alias="HOLDER_SUM_RELATIVE_TOLERANCE", ge=0.0, le=1e-3
     )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    # A backfill skips a (target, day) that already has a verified publication on the
+    # canonical anchor. With this on (default) the config hash is NOT part of that test,
+    # matching what the warehouse serves; off restores the registry-gated view, so a config
+    # change forces a re-census of every earlier day in the range (2026-09-12: a pass over
+    # 2025-05..09 redid 100 published days at ~4 min each).
+    skip_published_any_config_hash: bool = Field(
+        default=True, alias="SKIP_PUBLISHED_ANY_CONFIG_HASH"
+    )
 
     @field_validator("clickhouse_database")
     @classmethod

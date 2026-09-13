@@ -81,3 +81,37 @@ def test_published_target_addresses_returns_a_lowercased_set() -> None:
     )
 
     assert published == frozenset({"0xabc", "0xdef"})
+
+
+class _SqlCapturingClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__(rows=[])
+        self.sql: list[str] = []
+
+    def query(self, sql: str, **kwargs: Any) -> Any:
+        self.sql.append(sql)
+        return super().query(sql, **kwargs)
+
+
+def test_published_target_addresses_ignores_the_config_hash_by_default() -> None:
+    client = _SqlCapturingClient()
+    repository = ClickHouseRepository(client, "db")
+    repository.published_target_addresses(
+        chain_id=100, job_name="j", target_kind="token", snapshot_date=date(2026, 8, 31)
+    )
+    sql = client.sql[0]
+    assert "v_publications_current" not in sql
+    assert "v_census_attempts_current" in sql and "'verified'" in sql
+    assert "v_day_anchors_canonical" in sql
+    assert "config_hash" not in sql
+
+    client = _SqlCapturingClient()
+    repository = ClickHouseRepository(client, "db")
+    repository.published_target_addresses(
+        chain_id=100,
+        job_name="j",
+        target_kind="token",
+        snapshot_date=date(2026, 8, 31),
+        any_config_hash=False,
+    )
+    assert "v_publications_current" in client.sql[0]

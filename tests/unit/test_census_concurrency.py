@@ -29,7 +29,13 @@ class FakeRepository:
         self.terminal_errors: list[dict[str, Any]] = []
 
     def published_target_addresses(
-        self, *, chain_id: int, job_name: str, target_kind: str, snapshot_date: date
+        self,
+        *,
+        chain_id: int,
+        job_name: str,
+        target_kind: str,
+        snapshot_date: date,
+        any_config_hash: bool = True,
     ) -> frozenset[str]:
         self.prefetches.append((job_name, target_kind, snapshot_date))
         return self.published
