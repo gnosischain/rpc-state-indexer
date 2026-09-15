@@ -37575,3 +37575,104 @@ tokens:
   token_class: standard_erc20
   deployment_block: 29672516
   discovery_events: *id001
+
+# Ripio wrapped-fiat set, added 2026-09-15 so the curated balances census covers every
+# token the dbt tokens_whitelist serves (they were the only gap). deployment_block is the
+# first block carrying one of the token's logs; no transfers exist before it, so no holder
+# can either.
+- address: '0x0dc4f92879b7670e5f4e4e6e3c801d229129d90d'
+  symbol: wARS
+  decimals: 18
+  token_class: standard_erc20
+  deployment_block: 44763972
+  date_start: 2026-02-19
+  zero_address_role: event_sentinel
+  balance_function: balanceOf
+  supply_functions:
+  - totalSupply
+  discovery_events:
+  - abi: erc20
+    event: Transfer
+    holder_topics:
+    - 1
+    - 2
+- address: '0x337e7456b420bd3481e7fa61fa9850343d610d34'
+  symbol: wMXN
+  decimals: 18
+  token_class: standard_erc20
+  deployment_block: 44764067
+  date_start: 2026-02-19
+  zero_address_role: event_sentinel
+  balance_function: balanceOf
+  supply_functions:
+  - totalSupply
+  discovery_events:
+  - abi: erc20
+    event: Transfer
+    holder_topics:
+    - 1
+    - 2
+- address: '0xd76f5faf6888e24d9f04bf92a0c8b921fe4390e0'
+  symbol: wBRL
+  decimals: 18
+  token_class: standard_erc20
+  deployment_block: 44764114
+  date_start: 2026-02-19
+  zero_address_role: event_sentinel
+  balance_function: balanceOf
+  supply_functions:
+  - totalSupply
+  discovery_events:
+  - abi: erc20
+    event: Transfer
+    holder_topics:
+    - 1
+    - 2
+- address: '0x8a1d45e102e886510e891d2ec656a708991e2d76'
+  symbol: wCOP
+  decimals: 18
+  token_class: standard_erc20
+  deployment_block: 44764271
+  date_start: 2026-02-19
+  zero_address_role: event_sentinel
+  balance_function: balanceOf
+  supply_functions:
+  - totalSupply
+  discovery_events:
+  - abi: erc20
+    event: Transfer
+    holder_topics:
+    - 1
+    - 2
+- address: '0x61d450a098b6a7f69fc4b98ce68198fe59768651'
+  symbol: wCLP
+  decimals: 18
+  token_class: standard_erc20
+  deployment_block: 44764384
+  date_start: 2026-02-19
+  zero_address_role: event_sentinel
+  balance_function: balanceOf
+  supply_functions:
+  - totalSupply
+  discovery_events:
+  - abi: erc20
+    event: Transfer
+    holder_topics:
+    - 1
+    - 2
+- address: '0x4f34c8b3b5fb6d98da888f0fea543d4d9c9f2ebe'
+  symbol: wPEN
+  decimals: 18
+  token_class: standard_erc20
+  deployment_block: 44764415
+  date_start: 2026-02-19
+  zero_address_role: event_sentinel
+  balance_function: balanceOf
+  supply_functions:
+  - totalSupply
+  discovery_events:
+  - abi: erc20
+    event: Transfer
+    holder_topics:
+    - 1
+    - 2
