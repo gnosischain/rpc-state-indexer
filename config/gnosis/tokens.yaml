@@ -13896,6 +13896,13 @@ tokens:
   # (2022-11-30). The previous value 31866249 (2024-01-09) was 14 months late and silently
   # truncated this contract's history — it is the retired half of the 2024-08 GBPe migration.
   deployment_block: 25223106
+  # Same shape as EURe v1 below: since the 2024-08-25 migration this contract is a facade over
+  # the 0x8e34bfec… ledger (verified on chain 2026-09-16: identical totalSupply and identical
+  # balanceOf for the top holder). Holders that only ever transacted on the new contract are
+  # invisible to this contract's own Transfer scan, so without the alias the holder sum falls
+  # short of totalSupply and every census is PublicationBlocked (13 attempts, 2026-09-14/15).
+  universe_aliases:
+  - '0x8e34bfec4f6eb781f9743d9b4af99cd23f9b7053'
   discovery_events:
   - abi: erc20
     event: Transfer
