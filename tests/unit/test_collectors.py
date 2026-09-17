@@ -35,6 +35,7 @@ TOKEN = "0x" + "99" * 20
 POOL = "0x" + "88" * 20
 INDEX_SOURCE = "0x" + "77" * 20
 RESERVE = "0x" + "66" * 20
+ZERO = "0x" + "00" * 20
 A = "0x" + "11" * 20
 B = "0x" + "22" * 20
 C = "0x" + "33" * 20
@@ -186,6 +187,7 @@ async def test_full_erc20_supply_is_exact(supply: int, expected: bool) -> None:
             f"balanceOf/{A}": 1,
             f"balanceOf/{B}": 2,
             "scalar/totalSupply": supply,
+            f"sentinel/{ZERO}": 0,
         }
     )
 
@@ -332,6 +334,7 @@ async def test_full_erc20_supply_dust_publishes_only_with_tolerance(
             f"balanceOf/{A}": supply // 2,
             f"balanceOf/{B}": supply // 2 - 1,
             "scalar/totalSupply": supply,
+            f"sentinel/{ZERO}": 0,
         }
     )
 
@@ -360,3 +363,93 @@ def test_token_cannot_alias_itself_or_repeat_aliases() -> None:
     with pytest.raises(ValueError):
         TokenConfig(**{**base, "universe_aliases": [other, other]})
     assert TokenConfig(**{**base, "universe_aliases": [other]}).universe_aliases == [other]
+
+
+@pytest.mark.asyncio
+async def test_sentinel_balance_is_subtracted_from_expected_supply() -> None:
+    """A balance stranded at 0x0 belongs to totalSupply but not to any holder.
+
+    Measured on Gnosis 2026-09-17: WxDAI holds 23,461,704,877,845,424 wei at the zero
+    address and its holder sum was short by exactly that, which pushed the relative gap
+    over the 1e-9 publication tolerance on every day supply fell below ~20,000,000 and
+    silently cost 445 census days. Subtracting the sentinel makes the invariant exact.
+    """
+
+    sentinel = 23_461_704_877_845_424
+    supply = 10**24
+    executor = FakeExecutor(
+        {
+            f"balanceOf/{A}": supply // 2,
+            f"balanceOf/{B}": supply // 2 - sentinel,
+            "scalar/totalSupply": supply,
+            f"sentinel/{ZERO}": sentinel,
+        }
+    )
+
+    result = await Erc20Collector(executor).collect(
+        token=token_config(),
+        universe=universe(A, B),
+        anchor=ANCHOR,
+        integrity_mode=IntegrityMode.FULL_SUPPLY,
+    )
+
+    equality = result.integrity_checks[1]
+    assert equality.check == "holder_sum_equals_total_supply"
+    assert equality.observed == supply - sentinel
+    assert equality.expected == supply - sentinel
+    assert equality.passed is True
+    assert result.verified is True
+    # The sentinel is evidence, never a published holder row.
+    assert all(row.holder_address != ZERO for row in result.balances)
+
+
+@pytest.mark.asyncio
+async def test_zero_sentinel_leaves_the_invariant_untouched() -> None:
+    """35 of 36 curated Gnosis tokens read zero at 0x0; the fix must be a no-op there."""
+
+    supply = 3
+    executor = FakeExecutor(
+        {
+            f"balanceOf/{A}": 1,
+            f"balanceOf/{B}": 2,
+            "scalar/totalSupply": supply,
+            f"sentinel/{ZERO}": 0,
+        }
+    )
+
+    result = await Erc20Collector(executor).collect(
+        token=token_config(),
+        universe=universe(A, B),
+        anchor=ANCHOR,
+        integrity_mode=IntegrityMode.FULL_SUPPLY,
+    )
+
+    equality = result.integrity_checks[1]
+    assert equality.observed == supply
+    assert equality.expected == supply
+    assert equality.passed is True
+
+
+@pytest.mark.asyncio
+async def test_holder_role_zero_address_is_not_read_as_a_sentinel() -> None:
+    """When 0x0 is a declared holder its balance is already inside the sum."""
+
+    base = token_config().model_dump()
+    tok = TokenConfig(**{**base, "zero_address_role": "holder"})
+    executor = FakeExecutor(
+        {
+            f"balanceOf/{A}": 1,
+            f"balanceOf/{B}": 2,
+            "scalar/totalSupply": 3,
+        }
+    )
+
+    result = await Erc20Collector(executor).collect(
+        token=tok,
+        universe=universe(A, B),
+        anchor=ANCHOR,
+        integrity_mode=IntegrityMode.FULL_SUPPLY,
+    )
+
+    assert all(call.key != f"sentinel/{ZERO}" for call in executor.seen_calls)
+    assert result.integrity_checks[1].passed is True

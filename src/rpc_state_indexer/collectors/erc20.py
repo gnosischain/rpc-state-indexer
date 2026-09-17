@@ -23,6 +23,8 @@ from rpc_state_indexer.execution.base import ContractCall, HistoricalCallExecuto
 from .common import UIntCallSpec, completeness_check, execute_uint_calls
 from .models import CollectionError, TokenCollectionResult
 
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
 _SCALAR_CALLDATA = {
     "totalSupply": TOTAL_SUPPLY_SELECTOR,
     "scaledTotalSupply": function_selector("scaledTotalSupply()"),
@@ -124,6 +126,30 @@ class Erc20Collector:
                 )
             )
 
+        # The zero address is excluded from the holder universe when it is an event
+        # sentinel, but totalSupply() still counts whatever sits there, so the holder sum
+        # is short by exactly that balance and the FULL_SUPPLY invariant never holds.
+        # Measured 2026-09-17 on Gnosis: of 36 curated tokens only WxDAI holds anything at
+        # 0x0 (23,461,704,877,845,424 wei), and that is precisely its shortfall; every other
+        # token reads zero there and already reconciles exactly. Reading the sentinel and
+        # subtracting it makes the invariant exact for WxDAI and a no-op for the rest.
+        # The balance is NOT emitted as a holder row: 0x0 stays out of the published census.
+        sentinel_key: str | None = None
+        is_sentinel_zero = token.zero_address_role == "event_sentinel"
+        if integrity_mode is IntegrityMode.FULL_SUPPLY and is_sentinel_zero:
+            sentinel_key = f"sentinel/{ZERO_ADDRESS}"
+            specs.append(
+                UIntCallSpec(
+                    call=ContractCall(
+                        key=sentinel_key,
+                        target=token.address,
+                        calldata=balance_of_calldata(ZERO_ADDRESS),
+                    ),
+                    subject_address=ZERO_ADDRESS,
+                    call_kind="balanceOf_sentinel",
+                )
+            )
+
         decoded = await execute_uint_calls(self.executor, specs, anchor)
         balances: list[BalanceRow] = []
         scalars: list[ScalarRow] = []
@@ -177,9 +203,19 @@ class Erc20Collector:
                 expected=len(specs),
             )
         ]
+        sentinel_balance: int | None = None
+        if sentinel_key is not None:
+            sentinel_call = decoded.calls[sentinel_key]
+            if sentinel_call.observation.ok:
+                sentinel_balance = sentinel_call.observation.value
+            else:
+                errors.append(sentinel_call.as_error())
+
         if integrity_mode is IntegrityMode.FULL_SUPPLY:
             observed_sum = sum(row.balance_raw for row in balances)
             expected_supply = scalar_values.get("totalSupply")
+            if expected_supply is not None and sentinel_balance is not None:
+                expected_supply -= sentinel_balance
             checks.append(
                 IntegrityResult(
                     passed=(
