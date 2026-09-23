@@ -1,93 +1,177 @@
 # AGENTS.md — rpc-state-indexer
 
-Standalone archive-RPC state indexer. Runtime data flow is JSON-RPC → verified
-historical observations → the `rpc_indexer` ClickHouse database. The service must
-not import or query dbt models.
+Standalone archive-RPC state indexer. Runtime data flow is JSON-RPC → verified historical observations → the `rpc_state_indexer` ClickHouse
+database (one database for both chains, rows key on `chain_id`). The service must not import or query dbt. The one rule: **one census-class
+writer per chain.** Never start `census`, `backfill`, `densify`, `sweep`, `bench` or a second `daemon` while that chain's daemon or backfill Job is up.
 
 ## Non-negotiable correctness rules
 
 - Never turn an RPC, decode, code, anchor, or subcall failure into zero.
 - A successful uint256 return is exactly 32 bytes. Empty, short, and long returns fail.
 - Every state call is pinned to an immutable, finalized historical block.
-- At/after Multicall3 deployment, every batch has block/timestamp/parent-hash sentinels
-  at both head and tail.
-- Before Multicall3 deployment, use EIP-1898 or a number-pinned hash sandwich with
-  matching results from distinct provider groups.
+- At/after Multicall3 deployment, every batch has block/timestamp/parent-hash sentinels at both head and tail.
+- Before Multicall3 deployment, use EIP-1898 or a number-pinned hash sandwich with matching results from distinct provider groups.
 - Discovery is gap-free. A permanently failing block stops the scan.
-- Partial attempts are diagnostic only. Published views join through the append-only
-  publication gate.
+- Partial attempts are diagnostic only. Published views join through the append-only publication gate.
 - Repairs create new attempt IDs. Never delete or mutate a published attempt.
 - Addresses are lowercase `0x` strings; amounts are exact integers, never floats.
 
+## Where this runs (production)
+
+GKE Autopilot, deployed by Terraform from the private deployments repository (`gnosisdevops/infrastructure-gnosis-analytics`). Image `ghcr.io/gnosischain/gc-rpc-state-indexer`
+(`.github/workflows/build-and-release.yml:3-6,26-33,62-69`: built on push to `main` after `make check` + `make validate-config`, multi-arch, tagged `:latest` and `:<short sha>`; production pins a tag by digest).
+Production runs the image two ways. The daemon Deployments keep the image entrypoint with `args = ["daemon"]` (stack `deployment.tf:86`; `scripts/entrypoint.sh:4-8` execs `rpc-state-indexer "$@"`, no args = `daemon`, `Dockerfile:30-31`). Every Job and CronJob overrides it with `/bin/sh -c <wrapper>` (stack `backfill.tf:70-71`, `compute_backfill.tf:65-66`, `cronjobs.tf:126-129`), and the wrapper calls `rpc-state-indexer <subcommand>` itself, so `scripts/entrypoint.sh` never runs in those pods. `Makefile`, the Compose files, `.env*` and `scripts/catalog/` are LOCAL-ONLY.
+
+| Role | What it runs (exact args / env) | Schedule | Writes (`rpc_state_indexer.*`) |
+|---|---|---|---|
+| chain-100 continuous daemon (Deployment, 1 replica, `Recreate`) | `daemon`; `CHAIN=gnosis`, `DAEMON_JOBS` = all 7 jobs in `config/gnosis/jobs.yaml`, `DAEMON_POLL_SECONDS=3600`, `HOLDER_SUM_RELATIVE_TOLERANCE=1e-8`, `ARCHIVE_PROBE_FLOOR_BLOCK=16113691`, `WRITER_STALE_SECONDS=120`; other knobs: the stack's continuous config | continuous; each cycle = sweep, then census **yesterday** per listed job | every table except `migrations` and `pool_liquidity_profile` |
+| chain-1 continuous daemon (Deployment, 1 replica, `Recreate`) | `daemon`; `CHAIN=ethereum`, `DAEMON_JOBS` = both jobs in `config/ethereum/jobs.yaml`, poll 3600, RPC 8 concurrent / 30 rps; NO floor block, NO multicall batch size, tolerance at the code default | continuous | the same tables with `chain_id = 1` (no pool/CL rows) |
+| chain-100 discovery CronJob | ladder: `sleep WRITER_STALE_SECONDS+30`, then `discover --through <day>` at month-ends from 2018-11 and weekly for the trailing year (daily inside 2026-02-14..2026-03-09, the WBTC log storm); stops at the first failing step (`\|\| exit $?`); RPC 64/200, census concurrency 32 | `30 0 * * *` UTC, `Forbid`, backoff 3 (a retry re-walks the ladder) | `discovery_ranges`, `holder_universe`, `day_anchors`, `config_registry`, `writer_heartbeats` (discovery class) |
+| chain-100 compute CronJob | `compute --date <yesterday UTC>`; no RPC secret mounted | `30 2 * * *` UTC, `Forbid`, backoff 2 | `pool_liquidity_profile` |
+| backfill Job, chain 100 and chain 1 (count-gated by the stack's `run_backfill`; name carries a timestamp) | `sleep WRITER_STALE_SECONDS+60`, then `backfill --from --to --daily\|--month-end [--job]` (`backfill_daily` defaults true); chain 100 with an empty `backfill_job` then loops `compute --date` over the range ONLY if the ingest exited 0 (else it exits with the ingest's code so the Job retries), ignoring compute failures (`\|\| true`); RPC knobs default 128/400/32 (chain 100), 8/30/16 (chain 1); `backoff_limit` 20 | on demand; **the daemon is held at 0 replicas while the last apply set `run_backfill`** | census-side tables (+ `pool_liquidity_profile` on chain 100) |
+| chain-100 compute-backfill Job (`run_compute`, stable name) | `compute --date` for every day in `compute_from..compute_to`, skipping days that already hold `pool_liquidity_profile` rows | on demand; parks nothing | `pool_liquidity_profile` |
+
+Single-writer rule, as enforced: `WriterGuard` (`src/rpc_state_indexer/service.py:187-323`; clean-exit release at `service.py:243-274`) writes a per-chain heartbeat to `writer_heartbeats` (`migrations/006_operations.sql:1-14`) in one of two lock classes — `discover` alone is the discovery class; everything else that opens the service is the census class (`src/rpc_state_indexer/storage/repositories.py:622-649`).
+Startup refuses while a heartbeat of the same class is younger than `WRITER_STALE_SECONDS` (default 120, min 30, `settings.py:60`; beat every max(10, stale/3) s, `service.py:302-303`); no force flag. The release (`heartbeat_at = 1970-01-01`) runs only when Python unwinds normally or on an exception: `src/` installs no SIGTERM handler, so no pod stop (rollout, `Recreate`, scale-to-0, eviction) ever releases. The stacks add: daemon `replicas = 0` whenever `run_backfill` is set, strategy `Recreate` (a rolling update deadlocks on the lease), cron `concurrencyPolicy: Forbid`.
+Both stacks carry a `cutover_complete` switch: false = daemon at 0 replicas and chain-100 crons suspended (true on 2026-09-23); both crons have a 600 s starting deadline. So after EVERY pod stop, not only a crash, the replacement pod exits 1 until the lease is `WRITER_STALE_SECONDS` old (`service.py:221-228`): the daemon's CLI is PID 1 via the entrypoint's `exec` (`scripts/entrypoint.sh:8`) and ignores SIGTERM until the SIGKILL, and a forwarded SIGTERM kills a child without unwinding. Kill-safe: published keys are skipped.
+Deliberately NOT deployed: `migrate` (nothing migrates on start and the app never checks the ledger, `scripts/entrypoint.sh:4-8`, `service.py:340-369`, so an image that adds `migrations/0NN_*.sql` needs a human-run `migrate` BEFORE either stack is repinned), standalone `sweep`/`census`/`bench`/`probe`/`status`/`validate` workloads, any discovery or compute CronJob on chain 1, a compute step in the chain-1 backfill Job, any Service beyond the metrics port.
+Each stack pins its own image tag by digest in its `locals.tf`; the two pins can differ and trail `main` (different commits on 2026-09-23; stack comments claiming one image rolled together are not reliable), so check the pin before assuming current code runs in production. Alerting covers the chain-100 daemon only; the chain-1 daemon matches no alert rule, so its freshness is visible only through the warehouse query below.
+Production levers (Terraform variables; the only sanctioned route to history, applied by a human):
+- Chain 100 (stack `variables.tf:5-109`): `run_backfill`, `backfill_from`/`backfill_to` (YYYY-MM-DD, precondition from <= to, `backfill.tf:155-158`), `backfill_daily` (default true), `backfill_job` (empty = every job plus the compute loop), `backfill_arch` (amd64/arm64), `backfill_rpc_concurrency`, `backfill_rpc_requests_per_second`, `backfill_census_target_concurrency`, `backfill_archive_probe_floor_block` (empty = inherit); `run_compute`, `compute_from`/`compute_to` (precondition from <= to, `compute_backfill.tf:130-133`; the `variables.tf:95` comment calling that Job's name timestamped is stale, `compute_backfill.tf:4,10`); `continuous_arch` (daemon, default arm64).
+- Chain 1 (stack `variables.tf:3-52`): `run_backfill` and the `backfill_*` set only (no floor override). No compute Job, no compute or discovery cron.
+- Every apply is a saved plan run through the deployments repository's `ops/verdict.py` in live mode, handed to a human. While a backfill Job runs, see the apply hazard below.
+
+## Modes and commands — the complete list
+
+Console entry point `rpc-state-indexer` = `rpc_state_indexer.cli:app` (`pyproject.toml:12-13`); `python -m rpc_state_indexer` is the same CLI (`src/rpc_state_indexer/__main__.py:3-6`). Every command reads real env vars only (`settings.py:18-23`, `env_file=None`).
+"Safe beside the live writer" = may run while that chain's daemon or backfill Job holds the census lock. Paths are under `src/rpc_state_indexer/` unless rooted.
+Env: `CHAIN` is never required and defaults to `gnosis` (`settings.py:25`), so an Ethereum env without `CHAIN` silently runs against chain 100; `CONFIG_ROOT` `config`, `ABI_ROOT` `abis`, `MIGRATIONS_DIR` `migrations` (`settings.py:26-28`). The only hard requirements are `RPC_URLS` for commands that open RPC (`settings.py:111-118`) and `CLICKHOUSE_HOST` for those that open ClickHouse (`storage/clickhouse.py:27-28`); unset `RPC_PROVIDER_GROUPS` labels every URL `unclassified`, one group, which cannot meet the two-group number/hash quorum when no endpoint supports EIP-1898 (`settings.py:119-125`, `service.py:476-485`, `config/models.py:41`). Other knobs, with code defaults (`settings.py:32-97`): `RPC_CONCURRENCY` 8, `RPC_REQUESTS_PER_SECOND` 30, `MULTICALL_BATCH_SIZE` 250, `MULTICALL_MAX_PARALLEL_BATCHES` unset = `RPC_CONCURRENCY` (`runtime.py:79`), `LEGACY_RPC_BATCH_SIZE` 100, `MAX_RETRIES` 5, `CENSUS_TARGET_CONCURRENCY` 16 (1-256), `CL_MIN_ACTIVE_LIQUIDITY` 0, `DAEMON_POLL_SECONDS` 300 (>= 10), `METRICS_PORT` 9090, `CLICKHOUSE_PORT` 8443, `CLICKHOUSE_USER` `default`, `CLICKHOUSE_PASSWORD` empty (`settings.py:35`; keep it unquoted in `.env`, Compose passes quotes as literal characters → Code 516, `.agents/lessons/env-password-quoting.md`), `CLICKHOUSE_SECURE`/`CLICKHOUSE_VERIFY` true, `CLICKHOUSE_DATABASE` `rpc_state_indexer`; `LOG_LEVEL` (INFO) is parsed but read nowhere in `src/`, a no-op.
+
+| Invocation | What it does | Writes? | Safe beside live writer? | Required args / env (`CHAIN` has a default, see above) | Source |
+|---|---|---|---|---|---|
+| `rpc-state-indexer` / `python -m rpc_state_indexer` with no args | prints help, starts nothing (only the image entrypoint defaults to `daemon`) | no | yes | — | `cli.py:42-47`, `__main__.py:5-6` |
+| `validate-config [--chain] [--config-root] [--abi-root]` | offline catalog + ABI validation, no network | no | yes | — (all optional: `CHAIN` default `gnosis`, `CONFIG_ROOT` default `config`, `ABI_ROOT` default `abis`, `settings.py:25-27`; flags override) | `cli.py:298-320` |
+| `migrate` | apply `migrations/000..012` in order, recorded by filename + SHA-256, skip identical, error on a changed file | DDL + `migrations` table | idempotent DDL, but NOT a production workload: a human applies schema changes | `CLICKHOUSE_*`, `MIGRATIONS_DIR`; user needs CREATE DATABASE, CREATE TABLE, CREATE VIEW + DROP VIEW (ClickHouse checks both for the 24 `CREATE OR REPLACE VIEW` statements), INSERT + SELECT on `migrations` | `cli.py:323-350`, `storage/migrations.py:45-86,192-227,229-280`, `migrations/000_migrations.sql:1-11` |
+| `status [--json]` | read-only summary: canonical anchors, publications, `missing` coverage, unfinished/failed attempts, unresolved errors | no | yes (its `missing` count scans `v_coverage_calendar` unscoped: slow) | `CLICKHOUSE_*`, `CHAIN` | `cli.py:98-183,353-369` |
+| `validate [--json]` | read-only; exit 1 if any of FIVE counts is non-zero: anchor conflicts, publication conflicts, unfinished attempts, unrepaired failed attempts, unresolved errors | no | yes | `CLICKHOUSE_*`, `CHAIN` | `cli.py:186-256,372-394` |
+| `probe [--persist/--no-persist]` | per-endpoint RPC capability probe (chain id, HTTP batch, EIP-1898, finality tag, Multicall3 code hash, archive depth at the earliest token's deployment block, ignoring `ARCHIVE_PROBE_FLOOR_BLOCK`); exit 1 if any endpoint fails; no ClickHouse connection | no | yes | `RPC_URLS`, `RPC_PROVIDER_GROUPS`, `CHAIN` | `cli.py:397-516`, `cli.py:405,421-422` |
+| `discover [--through D] [--job J]` | advance gap-free `eth_getLogs` discovery for every `full_holders` token job (and universe aliases) through anchor(D); D defaults to yesterday; a failing range exits non-zero and does not advance coverage | `discovery_ranges`, `holder_universe`, `day_anchors`, `config_registry`, `writer_heartbeats` | **yes, from the production image only**: discovery lock class; a different catalog re-registers `config_registry` | `RPC_*`, `CLICKHOUSE_*`, `CHAIN` | `cli.py:550-568`, `service.py:187-192,365,616-668,1101-1111` |
+| `sweep [--through D] [--sweep S]` | address-less `eth_getLogs` per `config/<chain>/sweeps.yaml`, committed in `checkpoint_blocks` windows (default 100000) so it resumes; serves `/live` `/ready` `/health` `/metrics` (`observability/health.py:16-19`) | `sweep_ranges`, `wallet_interaction_logs`, `day_anchors`, `config_registry`, `writer_heartbeats` | **no**: census class; the daemon runs it at the start of every cycle | `RPC_*`, `CLICKHOUSE_*`, `CHAIN`, `METRICS_PORT` | `cli.py:571-589`, `service.py:568-614,1114-1144,1319-1325`, `core/sweep_service.py:107`, `config/models.py:253` |
+| `census --date D [--job J]` | resolve the finalized anchor; run discovery for `full_holders` jobs (all jobs when `--job` is omitted; a discovery failure raises BEFORE any target, so nothing publishes); at most one token-metadata pass per process, only when a job uses a discovered token selector, anchored at YESTERDAY not D, its failure only logged (`token_metadata_pass_failed`, `service.py:765-799`); then census + publish every active unpublished target; per-target failures land in `census_errors`, the rest still publish, exit 1 | all census-side tables + `config_registry` | **no**: census class | `--date` REQUIRED; `RPC_*`, `CLICKHOUSE_*`, `CHAIN` | `cli.py:592-610`, `service.py:616-668,765-799,925-1025,1147-1157` |
+| `compute --date D [--module M]` | Layer-2 derived tables from `v_*_published` primitives; RPC-free, no writer guard, idempotent; the only registered module is `cl_profile` → `pool_liquidity_profile` | `pool_liquidity_profile` | **yes** | `--date` REQUIRED; `CLICKHOUSE_*`, `CHAIN` (no RPC) | `cli.py:613-631`, `service.py:1251-1286`, `compute/__init__.py:10`, `migrations/009_compute.sql:4-28` |
+| `backfill --from A --to B [--daily\|--month-end] [--job J]` | `census` per date: by default the last day of each month in range plus `--to` itself when it is not a month end, every day with `--daily`; a failed date is logged (`backfill_date_failed`) and the range continues; exit 1 at the end if any date failed; published keys are skipped; serves `/live` `/ready` `/health` `/metrics` | all census-side tables | **no**: census class (production parks the daemon instead) | `--from`, `--to` (from <= to); `RPC_*`, `CLICKHOUSE_*`, `CHAIN` | `cli.py:634-669`, `service.py:1081-1098,1160-1222` |
+| `densify --from A --to B [--job J]` | exactly `backfill --daily`, nothing else; production never invokes it (the Job passes `--daily`) | as `backfill` | **no** | as `backfill` | `cli.py:672-699`, `service.py:1225-1238` |
+| `bench [--date D]` | binary-search the largest verified single batch at anchor(D, default yesterday); prints `benchmark_complete`; persists NO benchmark table | `day_anchors`, `config_registry`, `writer_heartbeats` | **no**: takes the census lock, so it is refused while the daemon holds it | `RPC_*`, `CLICKHOUSE_*`, `CHAIN` | `cli.py:702-715`, `service.py:1027-1060,1241-1248` |
+| `daemon` | loop: check own heartbeat, sweep (if configured), `census(yesterday)` per `cadence: daily` job in `DAEMON_JOBS` (empty = all), sleep `DAEMON_POLL_SECONDS`; per-job and sweep failures are only logged (`daemon_job_failed`, `daemon_sweep_failed`); exits 1 on ANY other exception (lease/heartbeat lost, anchor not final, a ClickHouse or RPC error outside the per-target guard); serves `/live` `/ready` `/health` `/metrics` | everything its jobs touch + `config_registry` | it IS the writer | `RPC_*`, `CLICKHOUSE_*`, `CHAIN`, `DAEMON_JOBS`, `DAEMON_POLL_SECONDS`, `METRICS_PORT` | `cli.py:718-722`, `service.py:280-287,1289-1350`, `settings.py:71-74,106-109`, `observability/health.py:16-19` |
+| image entrypoint with no args | `daemon` | as `daemon` | as `daemon` | — | `scripts/entrypoint.sh:4-8`, `Dockerfile:30-31` |
+| LOCAL `make` / `make help` (default goal), `make install-dev`, `make check-fast`, `make check`, `make validate-config` | `help` prints the target list, which omits `sweep` (a real target); pip install; ruff + `scripts/no_zero_default.py` + `scripts/no_silent_rpc_failures.py` + offline pytest; `check` adds strict mypy over src and tests; `validate-config` runs the host-installed CLI (needs `make install-dev` first), not Compose; `PYTHON ?= python3`, `COMPOSE ?= docker compose` are overridable | no | yes | — | `Makefile:1-25` |
+| LOCAL `make run-migrations`, `make daemon`, `make job ARGS=…`, `make <status\|validate\|probe\|discover\|sweep\|census\|compute\|backfill\|densify\|bench> ARGS=…` | Compose wrappers (`migrate`; `daemon` with `METRICS_PORT` published; the named subcommand, default `status`); every service injects `${ENV_FILE:-.env}`; every wrapper passes `--build`, so it runs the WORKING TREE's code and catalog; no target uses `docker-compose.dev.yml` (explicit `-f` only: bind-mounts `config/ abis/ migrations/`, `LOG_LEVEL=DEBUG` on the daemon only) | as the wrapped command | as the wrapped command, against whatever `CLICKHOUSE_HOST` your env file names | `.env` (or `ENV_FILE=.env.ethereum`) | `Makefile:2,27-37`, `docker-compose.yml:1-35`, `docker-compose.dev.yml:1-17` |
+| LOCAL `make refresh-catalog` | `scripts/catalog/enumerate.py --incremental --out /app/scripts/catalog/out` via `--entrypoint python` in the jobs image with the host `scripts/` and `src/` bind-mounted (`PYTHONPATH=/hostsrc`), so it runs the WORKING TREE's scripts and source, not the image CLI (last `RPC_URLS` entry; watermarked Gnosis pool-creation scan; other flags `--sources --from-block --to-block --overlap` (10000) `--watermark`), then `assemble.py [--config-dir --out-dir]` with its defaults (`config/gnosis`, `scripts/catalog/out`; additive), then `validate-config`; Gnosis only; no warehouse connection | `config/gnosis/*.yaml`, `scripts/catalog/watermark.json`, `scripts/catalog/out/` on the host | yes | `RPC_URLS` | `Makefile:39-49`, `scripts/catalog/enumerate.py:1,26-31,48,257-267`, `scripts/catalog/assemble.py:30-31,163-166` |
+
+Every command that opens the service (`discover`, `sweep`, `census`, `backfill`, `densify`, `bench`, `daemon`) first registers its OWN catalog in `config_registry` (`service.py:365`, `core/census.py:185-194`), and the newest registration wins (`migrations/007_views.sql:16-40`).
+
+## What does not exist, or does not do what its name says
+
+- No `repair` command: the CLI has exactly 13 subcommands (`cli.py:298-722`), plus Typer's global `--help`, `--install-completion`, `--show-completion` (`add_completion` left at its default, `cli.py:42-47`). `README.md:315-316` says "the repair-request table exists" — no migration creates one (`migrations/000..012`). Re-running `census`/`backfill` on an unpublished key IS the repair: published keys are skipped (skip gate `service.py:979-1012`), each run mints a new attempt id (`core/census.py:293,360`), and the failed attempt stays as evidence with status `failed` (`core/census.py:341,423`).
+- `probe --persist` is a deprecated no-op (`cli.py:473-484`, `del persist`); `docs/runbook.md:107-112` and `README.md:186` still say the result is persisted. `probe` also ignores `ARCHIVE_PROBE_FLOOR_BLOCK` (`cli.py:405,421-422`), unlike the service startup probe (`service.py:172-178,439-442`): a shallow endpoint can fail `probe` yet serve the daemon.
+- `bench` writes no `rpc_benchmarks` table (`docs/runbook.md:141` claims it; no such table in `migrations/` or `src/`). It DOES take the census writer lock and persist `day_anchors` (`service.py:340-363,487-504,1028-1029`).
+- `validate` checks five counts (`cli.py:186-256`); the "per-block transfer-log count conflicts" check in `docs/runbook.md:511-518` is not implemented.
+- `census --date` and `compute --date` are spelled like options and are required: no default (`cli.py:594-597`, `cli.py:615-618`).
+- The database is `rpc_state_indexer` (`settings.py:36-38`, `.env.example:20`, both stacks). `README.md:12,176,274-278` and every SQL block in `docs/runbook.md` say `rpc_indexer`, a name that exists nowhere in production.
+- "Starter catalog: three tokens, one pool, four jobs" (`README.md:35-37`, `docs/runbook.md:79-83`, `config/AGENTS.md:22-23`, and the public docs page) is stale: `config/gnosis/jobs.yaml:2-135` defines seven jobs and `tokens.yaml` thousands of tokens. Derive counts from `validate-config`.
+- Stale agent memory: `.agents/MEMORY.md:8` ("consumers read only `v_*_published` views") is wrong for dbt, which reads the base tables; `.agents/MEMORY.md:20` and `.agents/memory/deployment-and-observability.md` still describe EKS, and its lines 51-52 say the health server runs "only in the daemon". Fix the entries rather than follow them.
+- The health/metrics server is started by `daemon`, `backfill`/`densify` and `sweep` only (`service.py:1120-1133,1169-1179,1303-1305`), not by `discover`, `census`, `bench` or `compute`. `/health` always returns HTTP 200; only its JSON body says `degraded` (`observability/health.py:37-44,58-60`).
+- `/ready` 503 means this process has not finished startup or its own heartbeat loop died (`service.py:1294-1300`, `observability/health.py:31-36,69-73`), not "another writer holds the lock". Only the `daemon` stops when its heartbeat loop dies, and only between jobs (`ensure_healthy`, `service.py:280-287,1316,1325,1340`, then exit 1). `backfill`/`densify`/`sweep`/`census`/`discover`/`bench` never check it: they keep writing unleased until done, and the lapse shows only as a `service_cleanup_failed` log event (component `writer_guard`) that does not change the exit code (`service.py:243-274,371-413`). A second writer can therefore start beside such a run.
+- Exit codes: 2 for a bad or missing option or an invalid date or range (`cli.py:287-291,660-661,691-692`); 1 for any command failure, including invalid settings (`cli.py:52-54,67-72`). For service commands only `ServiceError`/`JobRunError` messages are printed; any other exception shows only its class name, e.g. `census failed (⟨ExceptionClass⟩)` (`cli.py:538-543`), so read the JSON event log (`_emit`, `service.py:181-184`) for the cause.
+- The daemon never fills history: it censuses yesterday only (`service.py:1318`). "Catch-up" means retrying yesterday; missed days need the backfill Job.
+- Discovered (non-curated) targets whose last `DISCOVERED_QUARANTINE_THRESHOLD` (default 3) attempts all failed are silently skipped on later dates (`settings.py:65-69`, `service.py:836-862`; log event `discovered_targets_quarantined`). They show as `missing` coverage with no new `census_errors`.
+- `migrations/AGENTS.md:9-10,21` says the set is `000`–`007` and the next file is `008`; the set is `000`–`012` and the next is `013`.
+
+## Hazards
+
+Condition → what breaks → safe alternative; the procedure lives in the private runbook (section named), not here.
+- Second census-class writer on a chain (`census`/`backfill`/`densify`/`sweep`/`bench`/second `daemon` while the daemon or a backfill Job is up) → refused at startup, or a writer race → crash-loop and a paused feed. → propose the stack's `run_backfill` (it parks the daemon); runbook "Repairing — universe first, then the days".
+- Any service command (`discover`, `sweep`, `census`, `backfill`, `densify`, `bench`, `daemon`) run from a build whose catalog differs from the production image re-registers `config_registry` with its own hashes (latest insert wins) → `v_*_published` and `v_coverage_calendar` hide existing publications. → never run them against the production warehouse from a local build; `discover` is safe beside the writer only from the production image.
+- Any apply in EITHER stack while its backfill Job runs ends the running pod, in two ways: a bare apply (no `run_backfill`) destroys the Job and restores the daemon; an apply re-passing the same `-var`s still replaces the Job, because its name embeds `timestamp()` (stack `backfill.tf:9`) and `ignore_changes` covers only annotations (`backfill.tf:159-162`), so the pod is killed and a new one starts. → while a backfill Job runs, no apply in that stack; if an unrelated change cannot wait, a targeted apply that leaves the Job out of the plan is the only safe one (the compute-backfill Job's name is stable and survives a census apply). A hand-deleted Job leaves that chain's daemon at 0 replicas → only an apply without `run_backfill` restores it. → runbook "Repairing — universe first, then the days", step 3 (Restore the daemon).
+- Backfill cost is per day (curated ~230 s/day on arm64); a range wider than the missing days re-walks published days for nothing. A Job whose targets are all published can still exit non-zero and burn its backoff (the runbook has seen it): each date first re-resolves the anchor and re-runs discovery (`service.py:932-934`) before the skip gate (`service.py:979-1012`), so a wedged `eth_getLogs` range, an anchor failure or a ClickHouse error fails that date (`service.py:1187-1218`). Never judge a Job by its exit code; check `discovery_ranges` for `status = 'failed'`. → runbook "Repairing — universe first, then the days", step 2 (Refill the days).
+- Discovery failures are NOT in `census_errors`: a backfill failing every date after some point with empty `census_errors`, or a `holder_sum_equals_total_supply` refusal, is a wedged `eth_getLogs` range (`discovery_ranges`, `status = 'failed'`, scope by `finished_at`); re-censusing alone refuses again. → runbook "[danger] Discovery failures are not in census_errors".
+- A material catalog or vendored-CSV edit changes the effective config hash: the views hide old publications (`migrations/007_views.sql:94-131`) while the backfill skip gate ignores the hash by default (`SKIP_PUBLISHED_ANY_CONFIG_HASH=true`, `settings.py:90-97`, `storage/repositories.py:524-568`), so days look done and missing at once. → plan a controlled reindex: `docs/runbook.md` §14, `.agents/lessons/config-change-triggers-reindex.md`.
+- Editing an applied migration fails every future `migrate` (checksum) → add `migrations/013_<name>.sql`. → `migrations/AGENTS.md`.
+- Wrong or corrupt publication → deleting `census_attempts` or a *conflicting* publication destroys evidence or hides the conflict. → runbook "Corrupt / wrong publication".
+- `ARCHIVE_PROBE_FLOOR_BLOCK` gates EVERY endpoint at that block (`settings.py:46-54`): too high silently makes historical days unpublishable, too low drops the shallow provider for the process; `HOLDER_SUM_RELATIVE_TOLERANCE` at the code default 1e-9 (`settings.py:82-88`) silently refused 445 WXDAI days, which is why chain 100 runs 1e-8. Change either only with the measurement that justified the current value.
+- Downstream: dbt must select from the base tables, never from `v_*_published` (the hash gate once cut `api_gno_supply_daily` to two dates). → public docs page, "dbt does not read the views".
+
+## Health and verification is a warehouse query
+
+Did yesterday land? Every job in each chain's `DAEMON_JOBS` must carry yesterday (UTC):
+```sql
+SELECT chain_id, job_name, max(snapshot_date) AS latest_day FROM rpc_state_indexer.census_publications WHERE published_at >= now() - INTERVAL 3 DAY GROUP BY chain_id, job_name ORDER BY chain_id, job_name;
+```
+Healthy = exactly 7 rows for chain 100 and 2 for chain 1, each `latest_day = yesterday`; a job absent from the result is stale. It proves only that one target per job published. The daemon censuses only yesterday (`service.py:1318`) once its anchor is final and polls hourly; publications land roughly 00:19–03:11 UTC, before the 06:00 dbt cron.
+Yesterday still missing after ~03:30 UTC means the daemon is parked (a backfill Job exists), crash-looping, or a job failed (`daemon_job_failed` in its logs).
+Gap / coverage: `SELECT job_name, target_address, snapshot_date, coverage_status FROM rpc_state_indexer.v_coverage_calendar WHERE chain_id = 100 AND job_name = '⟨job⟩' AND snapshot_date >= today() - 30 AND coverage_status = 'missing'` — ALWAYS scope by job and window (unscoped is ~30M `missing` rows of never-backfilled history).
+The view only contains dates with a canonical anchor, and only for registered, enabled (`migrations/007_views.sql:39`), `cadence = 'daily'` targets inside their `coverage_start`/`coverage_end` window (`migrations/010_coverage_calendar_analyzer_fix.sql:20-31`). A day nobody anchored, or a target the latest registration disabled or never registered (discovered targets register only when a census resolves them, `service.py:828-831`), is absent, not `missing`: list anchored days with `SELECT snapshot_date FROM rpc_state_indexer.v_day_anchors_canonical WHERE chain_id = 100 AND snapshot_date >= today() - 30 ORDER BY snapshot_date`.
+Per-day backlog = attempted (`v_census_attempts_current`) minus published (`census_publications`), never a flat "N targets/day"; discovery health = `SELECT token_address, range_start_block, range_end_block_exclusive, error_class, finished_at FROM rpc_state_indexer.discovery_ranges FINAL WHERE chain_id = 100 AND status = 'failed' AND finished_at >= now() - INTERVAL 2 DAY` — a failed row never collapses (`scan_id` is in the key, `migrations/002_discovery.sql:23-33`), so a later `completed` row over the same blocks may already have healed it (values `failed`/`completed`, `core/discovery_service.py:123,161`).
+NOT health signals: pod `Running` or its restart count (a few restarts after start are normal), a Job's exit code, a large unscoped `missing` count, `/ready` on its own, `/health` (always HTTP 200), `rpc_indexer_daemon_cycles_total` (a backfill pod exports it pinned at 0), row counts per day (targets grow as tokens deploy), and `no persisted CL state for attempt …` on ~0.5–1% of `daily_cl_liquidity` targets (read-after-write miss; retries succeed).
+
+## Rules for agents
+
+- Derive from code (`cli.py`, `service.py`, `settings.py`, `migrations/`), never from `README.md`, `docs/runbook.md` or the numbers in this file; where they disagree the code wins, and the section above says where.
+- Local tooling (`Makefile`, Compose, `.env*`, `scripts/catalog/`) is not production. Production is the image entrypoint (daemons) and the stacks' `/bin/sh -c` wrappers (Jobs, CronJobs), plus the stacks' env values, all quoted above.
+- Never run a service command (`census`, `backfill`, `densify`, `sweep`, `bench`, `daemon`, `discover`) or `migrate` from a laptop against the production warehouse: it takes or races the chain's lock and re-registers the catalog. `validate-config`, `probe`, `status` and `validate` are the laptop-safe set; `compute` is lock-free but still writes.
+- Never assume access to the cluster or the private deployments repository. Propose exact commands for a human to run. Never run a git write, a Terraform apply, a cluster-mutating command or an image push yourself; read-only plans and read-only cluster reads are fine where you already have access.
+- Never a second writer, never scale a daemon above one replica, never change its strategy from `Recreate` (the new pod cannot take the lease). Never start a second backfill Job, and never a `discover` while the discovery CronJob's Job is running.
+- App-specific never-do: never coerce a failed or missing read to zero; never edit an applied migration; never delete `census_attempts` or a conflicting publication; never hand-delete a backfill Job (propose the plain apply); never query `v_coverage_calendar` unscoped; never judge completeness from an exit code, pod state, row count or counter; never point dbt at `v_*_published`; never print RPC URLs, credentials or holder addresses as metric labels or logs.
+- Record a new lesson as `.agents/lessons/<slug>.md` (templates in `.agents/templates/`) plus its one-line pointer in `.agents/LESSONS.md`; durable facts go to `.agents/memory/` + `.agents/MEMORY.md`. Fix a stale entry rather than leaving it.
+
+## Where the full procedures live
+
+- `README.md` — overview and quick start; least trusted (stale database name, catalog size and "repair table" claim, see above).
+- `docs/runbook.md` — in-repo operator walkthrough of every CLI command, diagnostic SQL, test matrix; `docs/architecture.md` — trust boundary, anchors, discovery, execution routing, publication gate; `docs/configuration.md` — catalog contracts; `docs/pre-multicall-history.md` — legacy execution guarantees and archive-depth limits.
+- `.agents/MEMORY.md`, `.agents/LESSONS.md` — durable facts and symptom-indexed traps; scoped guides `config/AGENTS.md`, `migrations/AGENTS.md`, `src/rpc_state_indexer/execution/AGENTS.md`.
+- Private runbook: https://github.com/gnosisdevops/infrastructure-gnosis-analytics/blob/main/runbooks/22-rpc-state-indexer.md — cluster commands, stack variables, the apply sequence, gap detection and repair, corrupt-publication and missed-day recovery, expected noise.
+- Public docs page: https://docs.analytics.gnosis.io/data-pipeline/ingestion/rpc-state-indexer/ — the same procedure without cluster identifiers, the published ClickHouse contract, and the dbt warning.
+- One-shot repairs: https://docs.analytics.gnosis.io/operations/runbooks/one-shot-jobs/ — rpc-state repairs go through the Terraform-gated backfill Job, never a cloned Job (cerebro-docs `docs/operations/runbooks/one-shot-jobs.md:22`).
+- dbt after a refill: private runbook https://github.com/gnosisdevops/infrastructure-gnosis-analytics/blob/main/runbooks/31-dbt-reprocess-after-upstream-repair.md and public https://docs.analytics.gnosis.io/operations/runbooks/dbt-reprocess/ — nothing to flip; past months need drop-partition + append with both month vars (cerebro-docs `docs/operations/runbooks/dbt-reprocess.md:48`).
+- Deployments stacks: the two stacks for this app in the private deployments repository (chain 100: daemon, discovery and compute CronJobs, backfill and compute-backfill Jobs; chain 1: daemon and backfill Job) — every production env value, schedule and Job wrapper, each with its README.
+- Consumer side: `dbt-cerebro/models/rpc_state_indexer/AGENTS.md` — how dbt selects the published attempt from the base tables.
+
 ## Workflow
 
-1. Update configuration/domain contracts before runtime code that consumes them.
-2. Add or update offline tests for every failure branch.
-3. Run `make check-fast` for normal changes.
-4. Run `make check` before handoff when dependencies are available.
-5. Never print RPC URLs, credentials, or holder addresses as metric labels.
+Update configuration/domain contracts before the runtime code that consumes them; add or update offline tests for every failure branch; run `make check-fast` for normal changes and `make check` before handoff when dependencies are available.
 
 ## Agent knowledge base — read this before non-trivial work
 
-Shared, git-committed knowledge lives in [`.agents/`](.agents/). It is the fast path to
-context and the record of traps this codebase has already hit.
+Shared, git-committed knowledge lives in [`.agents/`](.agents/). It is the fast path to context and the record of traps this codebase has already hit.
 
-- **Before** editing: skim [`.agents/MEMORY.md`](.agents/MEMORY.md) (durable facts) and
-  [`.agents/LESSONS.md`](.agents/LESSONS.md) (symptom-indexed traps). Search LESSONS by
-  the symptom you are seeing.
-- **After** learning something durable: add or update one entry using the templates in
-  [`.agents/templates/`](.agents/templates/), then add its one-line pointer to the
-  matching index. One fact/lesson per file. See [`.agents/README.md`](.agents/README.md)
-  for the full convention.
-- Subsystem-local rules live in nested `AGENTS.md`:
-  [`src/rpc_state_indexer/execution/AGENTS.md`](src/rpc_state_indexer/execution/AGENTS.md),
-  [`migrations/AGENTS.md`](migrations/AGENTS.md), [`config/AGENTS.md`](config/AGENTS.md).
+- **Before** editing: skim [`.agents/MEMORY.md`](.agents/MEMORY.md) (durable facts) and [`.agents/LESSONS.md`](.agents/LESSONS.md) (symptom-indexed traps). Search LESSONS by the symptom you are seeing.
+- **After** learning something durable: add or update one entry using the templates in [`.agents/templates/`](.agents/templates/), then add its one-line pointer to the matching index. One fact/lesson per file. See [`.agents/README.md`](.agents/README.md) for the full convention.
+- Subsystem-local rules live in nested `AGENTS.md`: [`src/rpc_state_indexer/execution/AGENTS.md`](src/rpc_state_indexer/execution/AGENTS.md), [`migrations/AGENTS.md`](migrations/AGENTS.md), [`config/AGENTS.md`](config/AGENTS.md).
 
 ## Repo map
 
-Entry and orchestration (`src/rpc_state_indexer/`):
+Entry and orchestration (`src/rpc_state_indexer/`): `cli.py` — Typer CLI, the `rpc-state-indexer` console entry point; side-effect-free imports; `__main__.py` — the same app for `python -m`. `service.py` — orchestration (`run_discover/sweep/census/compute/backfill/densify/bench/daemon`, `WriterGuard`, `IndexerService`). `runtime.py` — explicit dependency construction (no import-time network).
+`settings.py` — env-only `RuntimeSettings` (pydantic-settings). Does **not** read `.env`. `domain.py` — frozen dataclasses/enums; `errors.py` — error types. Subpackages:
+- `config/` — typed YAML catalog loader, models, offline validation, effective-config hashing. `core/` — `anchors` (UTC day-end resolution), `discovery`/`discovery_service` (gap-free logs), `sweep_service` (wallet-interaction sweeps), `census` (append-only attempts + publication gate), `universes`.
+- `collectors/` — `erc20`, `atoken`, `pools`, `balancer` (Vault custody), `cl_liquidity` (tick sweeps), `metadata` (symbol/name/decimals) state collectors. `compute/` — Layer-2 registry (`base`) and modules (`cl_profile`); RPC-free, reads only published primitives.
+- `evm/` — `abi`, `events`, `calldata`, strict `decoding`, `metadata_decoding`. `execution/` — `router` (regime by block), `multicall3`, `legacy_rpc_batch`, `batch_planner`, `verification`, `code`.
+- `rpc/` — async `client`, `endpoint`/`endpoint_pool`, `capabilities`, `classification`. `storage/` — ClickHouse `clickhouse`/`repositories`, checksum-verified `migrations`, read-back `digests`. `observability/` — Prometheus `metrics`, HTTP `health` server.
 
-- `cli.py` — Typer CLI, the `rpc-state-indexer` console entry point; side-effect-free imports.
-- `service.py` — orchestration (`run_discover/census/backfill/densify/bench/daemon`, `WriterGuard`).
-- `runtime.py` — explicit dependency construction (no import-time network).
-- `settings.py` — env-only `RuntimeSettings` (pydantic-settings). Does **not** read `.env`.
-- `domain.py` — frozen dataclasses/enums; `errors.py` — error types.
+Data (not code): `config/` (YAML catalog per chain + vendored CSV), `abis/` (committed ABI fragments), `migrations/` (`000`–`012` SQL). Prose docs: [`docs/`](docs/) (`architecture.md`, `configuration.md`, `runbook.md`, `pre-multicall-history.md`).
 
-Subpackages:
+## How to run (LOCAL ONLY)
 
-- `config/` — typed YAML catalog loader, models, offline validation, effective-config hashing.
-- `core/` — `anchors` (UTC day-end resolution), `discovery`/`discovery_service` (gap-free logs),
-  `census` (append-only attempts + publication gate), `universes`.
-- `collectors/` — `erc20`, `atoken`, `pools` state collectors.
-- `evm/` — `abi`, `events`, `calldata`, strict `decoding`.
-- `execution/` — `router` (regime by block), `multicall3`, `legacy_rpc_batch`, `batch_planner`, `verification`, `code`.
-- `rpc/` — async `client`, `endpoint`/`endpoint_pool`, `capabilities`, `classification`.
-- `storage/` — ClickHouse `clickhouse`/`repositories`, checksum-verified `migrations`, read-back `digests`.
-- `observability/` — Prometheus `metrics`, HTTP `health` server.
-
-Data (not code): `config/` (YAML catalog + vendored CSV), `abis/` (committed ABI fragments),
-`migrations/` (`000`–`007` SQL). Prose docs: [`docs/`](docs/)
-(`architecture.md`, `configuration.md`, `runbook.md`, `pre-multicall-history.md`).
-
-## How to run
-
-Config split: **YAML catalog = what to index; env vars = how the process runs.** The app
-does not auto-load `.env`; Docker Compose injects it via `env_file`, and local runs need
-`set -a; source .env; set +a` first. See [`.env.example`](.env.example) and
-[`docs/configuration.md`](docs/configuration.md).
-
+Config split: **YAML catalog = what to index; env vars = how the process runs.** The app does not auto-load `.env`; Docker Compose injects it via `env_file`, and local runs need `set -a; source .env; set +a` first. See [`.env.example`](.env.example) and [`docs/configuration.md`](docs/configuration.md).
+Assume the local `.env`/`.env.ethereum` point at the PRODUCTION warehouse (they did on 2026-09-23): every `make <cmd>`, `make daemon`, `make run-migrations` and `docker compose ... jobs` writes it, and the Compose daemon (`restart: unless-stopped`, `docker-compose.yml:10`) keeps retrying the lease and becomes a second census-class writer the moment the production daemon is parked. Use a separate `ENV_FILE` for a non-production database.
 ```bash
-# Offline validation (no network)
-make validate-config
-make check-fast
-
-# Docker Compose (the deployment artifact) — profiles select the service
-docker compose --profile migrations run --rm migrations           # apply schema
-docker compose --profile jobs run --rm jobs probe --persist        # verify RPC
-docker compose --profile jobs run --rm jobs census --date <YYYY-MM-DD> --job <job>
-docker compose --profile jobs run --rm jobs status                 # / validate
-docker compose --profile daemon up --build daemon                  # continuous
+make validate-config && make check-fast                              # offline validation (no network)
+docker compose --profile migrations run --rm --build migrations      # apply schema
+docker compose --profile jobs run --rm --build jobs probe            # verify RPC
+docker compose --profile jobs run --rm --build jobs census --date <YYYY-MM-DD> --job <job>
+docker compose --profile jobs run --rm --build jobs status           # / validate
+docker compose --profile daemon up --build daemon                    # continuous
 ```
+Keep `--build` on every raw Compose line (the `make` wrappers already pass it, `Makefile:28,31,34,37`): all three services share the `rpc-state-indexer:local` image (`docker-compose.yml:5,22,31`), and without it `run` reuses a stale image's code, catalog and migrations (`.agents/lessons/docker-compose-build-noop.md`).
+Full operational detail — bootstrap, benchmarking, discovery, backfill, health/metrics, failure diagnosis — is in [`docs/runbook.md`](docs/runbook.md) (read `rpc_indexer` there as `rpc_state_indexer`).
 
-Full operational detail — bootstrap, benchmarking, discovery, backfill, health/metrics,
-failure diagnosis — is in [`docs/runbook.md`](docs/runbook.md).
+Verified 2026-09-23 against: `src/rpc_state_indexer/` {cli.py:1-722, service.py:1-1350, settings.py:1-130, storage/repositories.py:262-270,391-425,524-649, core/census.py:178-194,286-360,410-425, observability/health.py:1-124, core/sweep_service.py:80-125, core/discovery_service.py:60-180, storage/migrations.py:40-280, storage/clickhouse.py:14-30, runtime.py:67-110, errors.py:1-60, compute/__init__.py:1-12, config/models.py:41,253, __main__.py:1-6}; scripts/entrypoint.sh:1-8, Dockerfile:1-31, Makefile:1-49, docker-compose.yml:1-35, docker-compose.dev.yml:1-17, pyproject.toml:12-13, .env.example:1-46, .gitignore:1-2, .github/workflows/build-and-release.yml:1-69, scripts/catalog/{enumerate.py:1-50,224,250-270, assemble.py:1-35,158-170}; migrations/{000..012 (every statement kind), 000_migrations.sql:1-11, 002_discovery.sql:1-34, 005_publications.sql:1-38, 006_operations.sql:1-14, 007_views.sql:1-40,66-138, 009_compute.sql:4-28, 010_coverage_calendar_analyzer_fix.sql:1-31, AGENTS.md:1-26}; config/{chains.yaml:2-31, gnosis/jobs.yaml:1-135, ethereum/jobs.yaml:1-27, gnosis/sweeps.yaml:1-6, ethereum/sweeps.yaml:1-7, AGENTS.md:1-32}; docs/runbook.md:1-655, README.md:1-324, .agents/{MEMORY.md:1-21, LESSONS.md:1-28, memory/deployment-and-observability.md:1-60, lessons/env-password-quoting.md, lessons/docker-compose-build-noop.md}; deployments repository chain-100 and chain-1 stacks (README.md, locals.tf, variables.tf, deployment.tf, cronjobs.tf, backfill.tf, compute_backfill.tf, scripts/discovery.sh), ops/verdict.py:1-30, its alerting rules and README, and runbooks/22-rpc-state-indexer.md:1-199; cerebro-docs docs/{data-pipeline/ingestion/rpc-state-indexer.md:1-230, operations/runbooks/one-shot-jobs.md:1-60, operations/runbooks/dbt-reprocess.md:40-50}
