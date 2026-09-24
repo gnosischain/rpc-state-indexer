@@ -7,7 +7,7 @@ import calendar
 import json
 import socket
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -1248,26 +1248,171 @@ async def run_bench(
         await service.close()
 
 
+def census_sources_ready(counts: Mapping[str, tuple[int, int]]) -> bool:
+    """True when every source job has published the date and has no census attempt in flight.
+
+    ``counts`` maps a census job name to ``(started_attempts, publications)`` for one date.
+    """
+
+    return bool(counts) and all(
+        published > 0 and started == 0 for started, published in counts.values()
+    )
+
+
+def _compute_source_jobs(catalog: Catalog, compute_module: object) -> tuple[str, ...]:
+    """The daily catalog jobs whose publications the module's sources are built from."""
+
+    modes = {
+        str(getattr(mode, "value", mode))
+        for mode in getattr(compute_module, "source_integrity_modes", ())
+    }
+    if not modes:
+        return ()
+    names: list[str] = []
+    for job in catalog.jobs.values():
+        mode = getattr(job, "integrity_mode", None)
+        if str(getattr(mode, "value", mode)) not in modes:
+            continue
+        if getattr(job, "cadence", "daily") != "daily":
+            continue
+        names.append(job.name)
+    return tuple(sorted(names))
+
+
+def _census_source_counts(
+    repository: ClickHouseRepository,
+    *,
+    chain_id: int,
+    job_names: Sequence[str],
+    snapshot_date: date,
+) -> dict[str, tuple[int, int]]:
+    counts: dict[str, tuple[int, int]] = {}
+    for job_name in job_names:
+        rows = repository.query_rows(
+            f"""
+            SELECT
+                (
+                    SELECT count()
+                    FROM {repository.database}.census_attempts FINAL
+                    WHERE chain_id = {{chain_id:UInt64}}
+                      AND job_name = {{job_name:String}}
+                      AND snapshot_date = {{snapshot_date:Date}}
+                      AND status = 'started'
+                ) AS started,
+                (
+                    SELECT count()
+                    FROM {repository.database}.census_publications
+                    WHERE chain_id = {{chain_id:UInt64}}
+                      AND job_name = {{job_name:String}}
+                      AND snapshot_date = {{snapshot_date:Date}}
+                ) AS published
+            """,
+            {"chain_id": chain_id, "job_name": job_name, "snapshot_date": snapshot_date},
+        )
+        row = rows[0] if rows else {}
+        counts[job_name] = (int(row.get("started", 0)), int(row.get("published", 0)))
+    return counts
+
+
+def _await_census_sources(
+    repository: ClickHouseRepository,
+    *,
+    chain_id: int,
+    job_names: Sequence[str],
+    snapshot_date: date,
+    module_name: str,
+    wait_seconds: int,
+    poll_seconds: int,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    today: date | None = None,
+) -> None:
+    """Block until the date's source census jobs have finished publishing, or fail closed.
+
+    A date that is still being censused (yesterday or today) is polled until
+    ``wait_seconds`` elapse; readiness must hold on two consecutive polls with the same
+    publication counts, so a momentary gap between two targets' attempts cannot pass as
+    completion. Older dates are checked once: their census is either done or never ran.
+    Never computes over a partial day — a ServiceError is raised instead.
+    """
+
+    reference = today or datetime.now(UTC).date()
+    recent = snapshot_date >= reference - timedelta(days=1)
+    deadline = clock() + wait_seconds
+    stable: dict[str, tuple[int, int]] | None = None
+    while True:
+        counts = _census_source_counts(
+            repository, chain_id=chain_id, job_names=job_names, snapshot_date=snapshot_date
+        )
+        ready = census_sources_ready(counts)
+        detail = {
+            name: {"started": started, "published": published}
+            for name, (started, published) in counts.items()
+        }
+        if ready and (not recent or wait_seconds == 0 or stable == counts):
+            _emit(
+                "compute_sources_ready",
+                module=module_name,
+                snapshot_date=snapshot_date,
+                jobs=detail,
+            )
+            return
+        remaining = int(deadline - clock())
+        if not recent or wait_seconds == 0 or remaining <= 0:
+            raise ServiceError(
+                f"compute {module_name} for {snapshot_date}: source census not complete "
+                f"({json.dumps(detail, sort_keys=True)}); computing now would write a partial "
+                "day. Re-run once the daemon has published the day, or pass a longer "
+                "--wait-seconds."
+            )
+        stable = counts if ready else None
+        _emit(
+            "compute_waiting",
+            module=module_name,
+            snapshot_date=snapshot_date,
+            jobs=detail,
+            ready=ready,
+            remaining_seconds=remaining,
+        )
+        sleep(min(poll_seconds, max(remaining, 1)))
+
+
 def run_compute(
     *,
     settings: RuntimeSettings,
     snapshot_date: date,
     module: str | None = None,
+    wait_seconds: int | None = None,
 ) -> None:
     """Recompute Layer 2 derived tables for one date. RPC-free: no runtime, no writer guard.
 
     Reads only published primitives and writes derived tables, so it needs the ClickHouse
-    repository alone. Idempotent — re-running reproduces the same data rows.
+    repository alone. Idempotent — re-running reproduces the same data rows. Before a
+    module computes a recent date it waits for the census jobs behind its sources to finish
+    publishing that date (``COMPUTE_WAIT_SECONDS``), so a scheduled compute can never race
+    the daily census into a partial derived day.
     """
     catalog = build_catalog(settings)
     repository = build_repository(settings)
     repository.ping()
+    effective_wait = settings.compute_wait_seconds if wait_seconds is None else wait_seconds
     try:
         modules = [m for m in COMPUTE_REGISTRY if module is None or m.name == module]
         if module is not None and not modules:
             known = ", ".join(sorted(m.name for m in COMPUTE_REGISTRY))
             raise ServiceError(f"unknown compute module {module!r}; known: {known}")
         for compute_module in modules:
+            source_jobs = _compute_source_jobs(catalog, compute_module)
+            if source_jobs:
+                _await_census_sources(
+                    repository,
+                    chain_id=catalog.chain.chain_id,
+                    job_names=source_jobs,
+                    snapshot_date=snapshot_date,
+                    module_name=compute_module.name,
+                    wait_seconds=effective_wait,
+                    poll_seconds=settings.compute_wait_poll_seconds,
+                )
             count = compute_module.compute(
                 repository,
                 chain_id=catalog.chain.chain_id,

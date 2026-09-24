@@ -69,6 +69,14 @@ class RuntimeSettings(BaseSettings):
     )
     metrics_port: int = Field(default=9090, alias="METRICS_PORT", ge=1, le=65535)
     daemon_poll_seconds: int = Field(default=300, alias="DAEMON_POLL_SECONDS", ge=10)
+    # `compute --date D` for a recent D waits until the census jobs its modules read from
+    # have finished publishing D (no `started` attempt left, at least one publication, stable
+    # across two polls) before writing, so a compute slot can never race the daily census
+    # into a partial derived day. 0 disables the wait (check once, fail if not complete).
+    compute_wait_seconds: int = Field(default=5400, alias="COMPUTE_WAIT_SECONDS", ge=0)
+    compute_wait_poll_seconds: int = Field(
+        default=60, alias="COMPUTE_WAIT_POLL_SECONDS", ge=5
+    )
     # Comma-separated job names the daemon runs each cycle; empty = every daily job. Use this to
     # scope a single daemon away from the full multi-thousand-target catalog.
     daemon_jobs: str = Field(default="", alias="DAEMON_JOBS")

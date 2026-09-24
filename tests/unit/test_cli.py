@@ -99,3 +99,40 @@ def test_service_errors_keep_their_safe_actionable_message(
 
     assert result.exit_code == 1
     assert "bench failed: no safe single-batch size passed" in result.output
+
+
+def test_generic_errors_keep_the_message_but_redact_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_compute(**_kwargs: object) -> None:
+        raise RuntimeError(
+            "HTTPDriver for https://user:secret@warehouse.example:8443 returned response "
+            "code 500)\n Code: 241. DB::Exception: (total) memory limit exceeded"
+        )
+
+    monkeypatch.setattr(service, "run_compute", fail_compute)
+
+    result = runner.invoke(app, ["compute", "--date", "2026-09-23"])
+
+    assert result.exit_code == 1
+    assert (
+        "compute failed: RuntimeError: HTTPDriver for <url> returned response code 500) "
+        "Code: 241. DB::Exception: (total) memory limit exceeded"
+    ) in result.output
+    assert "warehouse.example" not in result.output
+    assert "secret" not in result.output
+
+
+def test_compute_passes_wait_seconds_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_compute(**kwargs: object) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(service, "run_compute", fake_compute)
+
+    result = runner.invoke(app, ["compute", "--date", "2026-09-23", "--wait-seconds", "0"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["wait_seconds"] == 0
+    assert seen["module"] is None

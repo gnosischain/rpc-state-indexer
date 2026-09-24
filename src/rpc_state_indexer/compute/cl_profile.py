@@ -29,6 +29,9 @@ def _digest_str(value: Any) -> str:
 class ClProfileModule:
     name = "cl_profile"
     output_table = "pool_liquidity_profile"
+    # The catalog jobs whose publications feed `sources()`: every daily job with this
+    # integrity mode must have finished publishing a date before it is computed.
+    source_integrity_modes: tuple[str, ...] = ("cl_liquidity",)
 
     def sources(self) -> tuple[str, ...]:
         return ("v_pool_cl_state_published", "v_pool_tick_liquidity_published")

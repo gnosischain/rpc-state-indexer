@@ -45,6 +45,11 @@ class ComputeModule(Protocol):
         """The ``v_*_published`` views this module reads (documentation + wiring check)."""
         ...
 
+    # Optional class attribute: the ``integrity_mode`` values of the catalog census jobs whose
+    # publications the sources are built from. ``run_compute`` waits for those jobs to finish
+    # publishing a recent date before calling ``compute`` (see ``census_sources_ready``).
+    # source_integrity_modes: tuple[str, ...] = ()
+
     def compute(
         self, store: ComputeStore, *, chain_id: int, snapshot_date: date
     ) -> int:

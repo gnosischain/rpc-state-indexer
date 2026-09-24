@@ -10,6 +10,7 @@ import asyncio
 import importlib
 import inspect
 import json
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import date
 from pathlib import Path
@@ -52,6 +53,26 @@ _SERVICE_MODULE = "rpc_state_indexer.service"
 def _fail(message: str, *, code: int = 1) -> NoReturn:
     typer.echo(f"error: {message}", err=True)
     raise typer.Exit(code)
+
+
+_URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s'\"()<>\[\]]+", re.IGNORECASE)
+_ERROR_MESSAGE_MAX_CHARS = 1500
+
+
+def _describe_error(exc: BaseException) -> str:
+    """Class name plus the exception message, with every URL redacted.
+
+    RPC URLs carry provider keys in their path and ClickHouse errors echo the server
+    URL, so URLs are replaced wholesale; the server's own error text ("Code: 241.
+    DB::Exception: ...") is what an operator needs and is kept.
+    """
+
+    text = " ".join(str(exc).split())
+    text = _URL_RE.sub("<url>", text)
+    if len(text) > _ERROR_MESSAGE_MAX_CHARS:
+        text = text[:_ERROR_MESSAGE_MAX_CHARS] + "..."
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
 
 
 def _format_settings_error(exc: ValidationError) -> str:
@@ -337,7 +358,7 @@ def migrate() -> None:
     except (MigrationError, ValueError) as exc:
         _fail(f"migration failed: {exc}")
     except Exception as exc:
-        _fail(f"migration failed ({type(exc).__name__})")
+        _fail(f"migration failed: {_describe_error(exc)}")
     finally:
         if client is not None:
             _close_clickhouse(client)
@@ -365,7 +386,7 @@ def status(
     except (ConfigError, OSError, ValueError) as exc:
         _fail(f"status unavailable: {exc}")
     except Exception as exc:
-        _fail(f"status unavailable ({type(exc).__name__})")
+        _fail(f"status unavailable: {_describe_error(exc)}")
     _print_mapping(row, json_output=json_output)
 
 
@@ -384,7 +405,7 @@ def validate(
     except (ConfigError, OSError, ValueError) as exc:
         _fail(f"operational validation unavailable: {exc}")
     except Exception as exc:
-        _fail(f"operational validation unavailable ({type(exc).__name__})")
+        _fail(f"operational validation unavailable: {_describe_error(exc)}")
 
     _print_mapping(row, json_output=json_output)
     failing = {name: int(value) for name, value in row.items() if int(value) != 0}
@@ -540,7 +561,7 @@ def _invoke_service(operation: str, settings: RuntimeSettings, **kwargs: Any) ->
         service_error = getattr(module, "ServiceError", None)
         if isinstance(service_error, type) and isinstance(exc, service_error):
             _fail(f"{operation} failed: {exc}")
-        _fail(f"{operation} failed ({type(exc).__name__})")
+        _fail(f"{operation} failed: {_describe_error(exc)}")
 
 
 async def _await_result(value: Awaitable[Any]) -> Any:
@@ -620,6 +641,18 @@ def compute(
         str | None,
         typer.Option("--module", help="Limit to one registered compute module."),
     ] = None,
+    wait_seconds: Annotated[
+        int | None,
+        typer.Option(
+            "--wait-seconds",
+            min=0,
+            help=(
+                "How long to wait for the date's source census jobs to finish publishing "
+                "before computing (yesterday/today only; older dates are checked once). "
+                "0 = check once and fail if not complete. Defaults to COMPUTE_WAIT_SECONDS."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Recompute Layer 2 derived tables from published primitives (RPC-free)."""
 
@@ -628,6 +661,7 @@ def compute(
         _load_settings(),
         snapshot_date=_parse_date(snapshot_date, "--date"),
         module=module,
+        wait_seconds=wait_seconds,
     )
 
 
