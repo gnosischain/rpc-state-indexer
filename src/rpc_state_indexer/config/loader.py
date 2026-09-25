@@ -25,6 +25,19 @@ from rpc_state_indexer.config.models import (
 from rpc_state_indexer.domain import IntegrityMode
 from rpc_state_indexer.errors import ConfigError
 
+#: Target fields that stay OUT of the effective-config hash while empty.
+#:
+#: Every field of TokenConfig/PoolConfig is hashed, and the views serve a publication
+#: only while its hash is the target's current one. A field added with an empty
+#: default therefore re-hashes EVERY existing target and hides all of its published
+#: history, although nothing it measures changed. `universe_aliases` (fa80947,
+#: 2026-09-08) did exactly that: hashed as `[]` for every token, it hid ~3.4M
+#: publications (2020 -> 2026-09-07) on both chains. A non-empty value is a real scope
+#: change and is hashed. When you add a defaulted field to either model, add it here in
+#: the same change; tests/unit/test_config_hashing.py pins production hashes and fails
+#: if you do not.
+HASH_NEUTRAL_WHEN_EMPTY_TARGET_FIELDS: tuple[str, ...] = ("universe_aliases",)
+
 
 class _UniqueKeyLoader(yaml.SafeLoader):
     """Safe YAML loader that rejects duplicate keys at every nesting level."""
@@ -170,10 +183,16 @@ class Catalog:
         selector = job_value.get("token_selector")
         if isinstance(selector, dict) and not selector.get("discovered"):
             selector.pop("discovered", None)
+        # The same rule for target fields added after history was published: an EMPTY
+        # value measures exactly what the target measured before the field existed.
+        target_value = target.model_dump(mode="json")
+        for name in HASH_NEUTRAL_WHEN_EMPTY_TARGET_FIELDS:
+            if name in target_value and not target_value[name]:
+                del target_value[name]
         return {
             "chain": chain_value,
             "job": job_value,
-            "target": target.model_dump(mode="json"),
+            "target": target_value,
             "universe": universe_value,
             "vendor_hashes": vendor_hashes,
         }

@@ -27,6 +27,12 @@ pydantic models in `config/models.py`. Root rules: [`../AGENTS.md`](../AGENTS.md
   material edit changes the hash and drops old publications out of the current views —
   plan a controlled reindex:
   [`config-change-triggers-reindex`](../.agents/lessons/config-change-triggers-reindex.md).
+  A CODE change can do the same: every field of `TokenConfig`/`PoolConfig` is hashed, so a
+  new defaulted field re-hashes every target. List it in
+  `HASH_NEUTRAL_WHEN_EMPTY_TARGET_FIELDS` (`config/loader.py`) in the same change;
+  `tests/unit/test_config_hashing.py` fails otherwise. Adding a token to a job's explicit
+  `token_selector.addresses` re-hashes every token already in that job (the list is part of
+  the job payload each target hashes).
 - Verify every deployment block, lifetime, event set, pool asset, and aToken index source
   against chain data before treating the catalog as production
   (`docs/runbook.md` §17 checklist).
