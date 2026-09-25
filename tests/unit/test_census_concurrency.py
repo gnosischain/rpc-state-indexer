@@ -93,14 +93,12 @@ def _service(
     async def resolve_anchor(_day: date) -> BlockRef:
         return ANCHOR
 
-    async def discover(*_a: Any, **_k: Any) -> BlockRef:
-        return ANCHOR
-
     async def metadata_once() -> None:
         return None
 
     monkeypatch.setattr(subject, "resolve_anchor", resolve_anchor)
-    monkeypatch.setattr(subject, "discover", discover)
+    # supply_probe is not a full-holder universe; discovery scoping has its own tests.
+    monkeypatch.setattr(subject, "_needs_holder_discovery", lambda _job: False)
     monkeypatch.setattr(subject, "_resolve_metadata_once", metadata_once)
     monkeypatch.setattr(subject, "_runner", lambda: runner)
     monkeypatch.setattr(subject, "_jobs", lambda _name: (job,))

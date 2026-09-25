@@ -193,7 +193,9 @@ ORDER BY token_address, topic0;
 
 A gap between adjacent completed ranges means discovery has not yet closed that
 window; rerun the discover command to fill it. The requested census still advances
-discovery through its anchor before collection.
+discovery through its anchor before collection, but only for the targets it still has to
+census (plus their universe aliases); a census whose targets are all published runs no
+discovery, so it cannot fill that window either.
 
 ## 7. One census
 

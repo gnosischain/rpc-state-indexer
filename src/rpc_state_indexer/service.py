@@ -624,13 +624,42 @@ class IndexerService:
         anchor = anchor or await self.resolve_anchor(snapshot_date)
         selected: dict[str, TokenConfig] = {}
         for job in self._jobs(job_name):
-            if job.target_kind != "tokens":
-                continue
-            if job.universe is None or not self._uses_full_holders(job.universe):
+            if not self._needs_holder_discovery(job):
                 continue
             for token in catalog.token_targets(job):
                 if self._active(token, snapshot_date, anchor.number):
                     selected[token.address] = token
+        await self._advance_discovery(
+            self._with_active_aliases(selected.values(), snapshot_date, anchor), anchor
+        )
+        return anchor
+
+    def _needs_holder_discovery(self, job: JobConfig) -> bool:
+        """Whether a job's targets need gap-free full-holder discovery before a census.
+
+        Static token selectors only: a discovered selector resolves its targets at runtime
+        and ``Catalog.token_targets`` returns none for it, so discovery never covered it.
+        """
+
+        selector = job.token_selector
+        return (
+            job.target_kind == "tokens"
+            and selector is not None
+            and not selector.discovered
+            and job.universe is not None
+            and self._uses_full_holders(job.universe)
+        )
+
+    def _with_active_aliases(
+        self,
+        tokens: Iterable[TokenConfig],
+        snapshot_date: date,
+        anchor: BlockRef,
+    ) -> list[TokenConfig]:
+        """``tokens`` plus their universe aliases active at the anchor, in address order."""
+
+        catalog, _, _ = self._required()
+        selected = {token.address: token for token in tokens}
         # Aliased ledgers are discovered under their own address, so a token whose
         # balances live on another contract sees that contract's holders too.
         for token in list(selected.values()):
@@ -638,9 +667,18 @@ class IndexerService:
                 alias_token = catalog.tokens[alias]
                 if self._active(alias_token, snapshot_date, anchor.number):
                     selected.setdefault(alias, alias_token)
+        return sorted(selected.values(), key=lambda item: item.address)
+
+    async def _advance_discovery(
+        self,
+        tokens: Sequence[TokenConfig],
+        anchor: BlockRef,
+    ) -> None:
+        """Advance discovery for each token through the anchor; raise if any range failed."""
+
         discovery = self._discovery_service()
         failures: list[str] = []
-        for token in sorted(selected.values(), key=lambda item: item.address):
+        for token in tokens:
             try:
                 await discovery.advance(
                     token,
@@ -665,7 +703,6 @@ class IndexerService:
             )
         if failures:
             raise JobRunError(failures)
-        return anchor
 
     def _runner(self) -> CensusRunner:
         catalog, repository, runtime = self._required()
@@ -930,8 +967,57 @@ class IndexerService:
     ) -> list[UUID]:
         catalog, repository, _ = self._required()
         anchor = await self.resolve_anchor(snapshot_date)
+        # The skip gate runs for every selected job BEFORE discovery, so discovery covers
+        # only the targets that still need a census. A date whose targets are all published
+        # (a backfill retry, a daemon re-poll) reads no discovery state and cannot fail on
+        # it: on 2026-09-25 a curated-balances retry pod re-ran discovery for 65 tokens on
+        # 17 fully published dates and died on a ClickHouse code 241 in one of them.
+        plan: list[tuple[JobConfig, str, list[tuple[TokenConfig | PoolConfig, str]]]] = []
+        for job in self._jobs(job_name):
+            target_kind = "token" if job.target_kind == "tokens" else "pool"
+            # One prefetch per job replaces one publication_exists per target.
+            published = await asyncio.to_thread(
+                repository.published_target_addresses,
+                chain_id=catalog.chain.chain_id,
+                job_name=job.name,
+                target_kind=target_kind,
+                snapshot_date=snapshot_date,
+                any_config_hash=self.settings.skip_published_any_config_hash,
+            )
+            work: list[tuple[TokenConfig | PoolConfig, str]] = []
+            if job.target_kind == "tokens":
+                for token in self._token_targets(job):
+                    if not self._active(token, snapshot_date, anchor.number):
+                        continue
+                    if token.address.lower() in published:
+                        CENSUS_PUBLICATIONS.labels(job.name, "token", "skipped").inc()
+                        _emit(
+                            "census_skipped_published",
+                            job=job.name,
+                            target=token.symbol,
+                            snapshot_date=snapshot_date,
+                        )
+                        continue
+                    work.append((token, token.symbol))
+            else:
+                for pool in catalog.pool_targets(job):
+                    if not self._active(pool, snapshot_date, anchor.number):
+                        continue
+                    if pool.address.lower() in published:
+                        CENSUS_PUBLICATIONS.labels(job.name, "pool", "skipped").inc()
+                        continue
+                    work.append((pool, pool.name))
+            plan.append((job, target_kind, work))
         # All full-holder discovery completes before any full-supply publication.
-        await self.discover(snapshot_date, job_name=job_name, anchor=anchor)
+        pending: dict[str, TokenConfig] = {}
+        for job, _, work in plan:
+            if self._needs_holder_discovery(job):
+                for target, _ in work:
+                    pending[target.address] = cast(TokenConfig, target)
+        if pending:
+            await self._advance_discovery(
+                self._with_active_aliases(pending.values(), snapshot_date, anchor), anchor
+            )
         await self._resolve_metadata_once()
         runner = self._runner()
         attempts: list[UUID] = []
@@ -976,40 +1062,7 @@ class IndexerService:
             )
             return attempt, None
 
-        for job in self._jobs(job_name):
-            target_kind = "token" if job.target_kind == "tokens" else "pool"
-            # One prefetch per job replaces one publication_exists per target.
-            published = await asyncio.to_thread(
-                repository.published_target_addresses,
-                chain_id=catalog.chain.chain_id,
-                job_name=job.name,
-                target_kind=target_kind,
-                snapshot_date=snapshot_date,
-                any_config_hash=self.settings.skip_published_any_config_hash,
-            )
-            work: list[tuple[TokenConfig | PoolConfig, str]] = []
-            if job.target_kind == "tokens":
-                for token in self._token_targets(job):
-                    if not self._active(token, snapshot_date, anchor.number):
-                        continue
-                    if token.address.lower() in published:
-                        CENSUS_PUBLICATIONS.labels(job.name, "token", "skipped").inc()
-                        _emit(
-                            "census_skipped_published",
-                            job=job.name,
-                            target=token.symbol,
-                            snapshot_date=snapshot_date,
-                        )
-                        continue
-                    work.append((token, token.symbol))
-            else:
-                for pool in catalog.pool_targets(job):
-                    if not self._active(pool, snapshot_date, anchor.number):
-                        continue
-                    if pool.address.lower() in published:
-                        CENSUS_PUBLICATIONS.labels(job.name, "pool", "skipped").inc()
-                        continue
-                    work.append((pool, pool.name))
+        for job, target_kind, work in plan:
             # gather preserves input order, so attempts/failures stay in target order
             # exactly as the serial loop produced them.
             results = await asyncio.gather(
