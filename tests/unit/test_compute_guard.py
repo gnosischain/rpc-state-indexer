@@ -1,5 +1,6 @@
 """The compute-before-census guard: a recent date is computed only once its source census
-jobs have finished publishing; older dates are checked once; nothing computes a partial day."""
+jobs have finished publishing; older dates are checked once; nothing computes a partial day;
+an attempt left `started` after its target published does not block the date."""
 
 from __future__ import annotations
 
@@ -28,6 +29,25 @@ class ScriptedRepository:
         assert parameters is not None and parameters["job_name"] == "daily_cl_liquidity"
         self.calls += 1
         started, published = self._readings.pop(0)
+        return [{"started": started, "published": published}]
+
+
+class CapturingRepository:
+    """Records the readiness query and answers with one (started, published) reading."""
+
+    database = "rpc_state_indexer"
+
+    def __init__(self, reading: tuple[int, int]) -> None:
+        self.reading = reading
+        self.sql = ""
+        self.parameters: dict[str, object] = {}
+
+    def query_rows(
+        self, sql: str, parameters: dict[str, object] | None = None
+    ) -> list[dict[str, int]]:
+        self.sql = sql
+        self.parameters = dict(parameters or {})
+        started, published = self.reading
         return [{"started": started, "published": published}]
 
 
@@ -66,6 +86,40 @@ def test_ready_needs_publications_and_no_started_attempts() -> None:
     assert not service.census_sources_ready({"j": (0, 0)})
     assert not service.census_sources_ready({})
     assert not service.census_sources_ready({"a": (0, 10), "b": (1, 10)})
+
+
+def test_started_count_skips_targets_already_published_that_date() -> None:
+    # 2026-10-17..19: every daily_cl_liquidity target published, yet 2-7 attempts whose
+    # terminal row never landed stayed `started` and blocked compute for good.
+    repo = CapturingRepository((0, 2519))
+
+    counts = service._census_source_counts(
+        repo,  # type: ignore[arg-type]
+        chain_id=100,
+        job_names=("daily_cl_liquidity",),
+        snapshot_date=date(2026, 10, 19),
+    )
+
+    assert counts == {"daily_cl_liquidity": (0, 2519)}
+    assert repo.parameters == {
+        "chain_id": 100,
+        "job_name": "daily_cl_liquidity",
+        "snapshot_date": date(2026, 10, 19),
+    }
+    started_sql = " ".join(repo.sql.split(") AS started")[0].split())
+    assert "census_attempts FINAL" in started_sql and "status = 'started'" in started_sql
+    head, anti_join = started_sql.split("(target_kind, target_address) NOT IN", 1)
+    assert anti_join.startswith(
+        " ( SELECT target_kind, target_address FROM rpc_state_indexer.census_publications"
+    )
+    # Scoped to the same chain, job and date: a publication on another date must not hide
+    # an attempt still in flight for this one.
+    for predicate in (
+        "chain_id = {chain_id:UInt64}",
+        "job_name = {job_name:String}",
+        "snapshot_date = {snapshot_date:Date}",
+    ):
+        assert predicate in head and predicate in anti_join
 
 
 def test_recent_date_waits_until_two_stable_ready_readings() -> None:
