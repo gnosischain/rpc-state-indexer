@@ -1304,7 +1304,9 @@ async def run_bench(
 def census_sources_ready(counts: Mapping[str, tuple[int, int]]) -> bool:
     """True when every source job has published the date and has no census attempt in flight.
 
-    ``counts`` maps a census job name to ``(started_attempts, publications)`` for one date.
+    ``counts`` maps a census job name to ``(started_attempts, publications)`` for one date,
+    where ``started_attempts`` counts only targets with no publication yet (see
+    ``_census_source_counts``).
     """
 
     return bool(counts) and all(
@@ -1339,6 +1341,17 @@ def _census_source_counts(
     job_names: Sequence[str],
     snapshot_date: date,
 ) -> dict[str, tuple[int, int]]:
+    """``(started_attempts, publications)`` per source job for one date.
+
+    A ``started`` attempt counts only while its target has no publication for the date.
+    An attempt whose terminal row never landed (the ``failed`` insert itself failed, e.g. a
+    code 241, or the pod died mid-attempt) stays ``started`` forever, and the daemon's
+    retry publishes the target under a new attempt id. Compute reads only the
+    ``v_*_published`` views, so such an attempt cannot change its input, but counting it
+    blocked that date's compute for good: 2026-10-17..19 each had 2-7 of these on
+    ``daily_cl_liquidity`` with all 2519 targets published.
+    """
+
     counts: dict[str, tuple[int, int]] = {}
     for job_name in job_names:
         rows = repository.query_rows(
@@ -1351,6 +1364,13 @@ def _census_source_counts(
                       AND job_name = {{job_name:String}}
                       AND snapshot_date = {{snapshot_date:Date}}
                       AND status = 'started'
+                      AND (target_kind, target_address) NOT IN (
+                          SELECT target_kind, target_address
+                          FROM {repository.database}.census_publications
+                          WHERE chain_id = {{chain_id:UInt64}}
+                            AND job_name = {{job_name:String}}
+                            AND snapshot_date = {{snapshot_date:Date}}
+                      )
                 ) AS started,
                 (
                     SELECT count()
